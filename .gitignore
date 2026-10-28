@@ -1,0 +1,8 @@
+/build/
+/dist/
+/downloads*/
+/.venv/
+*.part
+/coverage.out
+/.idea/
+/.vscode/
