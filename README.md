@@ -19,7 +19,7 @@ range resume — into one tidy directory per archive.
 Work in progress — architecture first, engine pieces landing one branch at a time:
 
 - [x] host abstraction + registry
-- [ ] links file parsing and archive grouping
+- [x] links file parsing and archive grouping
 - [ ] first host implementation
 - [ ] download engine (worker pool, range resume, retries)
 - [x] CI (vet, test, race, golangci-lint)
@@ -28,7 +28,14 @@ Work in progress — architecture first, engine pieces landing one branch at a t
 
 ## Usage
 
-Not wired up yet. Planned:
+In development. The current binary previews the download plan from a links
+file without resolving or downloading anything:
+
+```sh
+packrat --dry-run links.txt
+```
+
+Planned full usage:
 
 ```sh
 go install github.com/EliasLd/packrat/cmd/packrat@latest
