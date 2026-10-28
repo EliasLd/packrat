@@ -21,25 +21,30 @@ Work in progress — architecture first, engine pieces landing one branch at a t
 - [x] host abstraction + registry
 - [x] links file parsing and archive grouping
 - [x] first host implementation
-- [ ] download engine (worker pool, range resume, retries)
+- [x] download engine (worker pool, range resume, retries)
 - [x] CI (vet, test, race, golangci-lint)
 - [ ] polished CLI UX and per-part progress
 - [ ] release builds via goreleaser
 
 ## Usage
 
-In development. The current binary previews the download plan from a links
-file without resolving or downloading anything:
-
-```sh
-packrat --dry-run links.txt
-```
-
-Planned full usage:
-
 ```sh
 go install github.com/EliasLd/packrat/cmd/packrat@latest
 packrat links.txt
+```
+
+The engine parses the file, resolves every link and downloads all parts
+concurrently into `<output-dir>/<archive-name>/`. `ctrl-c` interrupts safely;
+rerunning the same command resumes from partial downloads.
+
+Flags: `-o dir` (output root, default `downloads`), `-c N` (download
+concurrency, default 8), `-rc N` (resolve concurrency, default 3),
+`-retries N` (default 5).
+
+Preview the plan without downloading:
+
+```sh
+packrat --dry-run links.txt
 ```
 
 With `links.txt` like:
