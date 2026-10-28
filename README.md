@@ -20,7 +20,7 @@ Work in progress — architecture first, engine pieces landing one branch at a t
 
 - [x] host abstraction + registry
 - [x] links file parsing and archive grouping
-- [ ] first host implementation
+- [x] first host implementation
 - [ ] download engine (worker pool, range resume, retries)
 - [x] CI (vet, test, race, golangci-lint)
 - [ ] polished CLI UX and per-part progress
