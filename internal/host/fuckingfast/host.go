@@ -34,10 +34,11 @@ var ErrLayoutChanged = errors.New("download button markup not found")
 // It is treated as transient and retried.
 var ErrNoDirectLink = errors.New("no direct download link returned")
 
-const (
-	userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-	hostName  = "fuckingfast"
-)
+// UserAgent is the browser user agent sent with requests to this host,
+// covering both landing page fetches and direct downloads.
+const UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+
+const hostName = "fuckingfast"
 
 var domains = map[string]bool{"fuckingfast.co": true, "fuckingfast.net": true}
 
@@ -166,7 +167,7 @@ func fetchPage(ctx context.Context, client HTTPClient, pageURL *url.URL) ([]byte
 		return nil, fmt.Errorf("build page request: %w", err)
 	}
 	req.Header = bhttp.Header{
-		"User-Agent": {userAgent},
+		"User-Agent": {UserAgent},
 		"Accept":     {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
 	}
 	resp, err := client.Do(req)
@@ -207,7 +208,7 @@ func triggerDownload(ctx context.Context, client HTTPClient, endpoint string, re
 		return "", fmt.Errorf("build download request: %w", err)
 	}
 	req.Header = bhttp.Header{
-		"User-Agent": {userAgent},
+		"User-Agent": {UserAgent},
 		"HX-Request": {"true"},
 		"Referer":    {referer.String()},
 	}

@@ -42,7 +42,7 @@ func Groups(links []Link) []Group {
 		} else {
 			base, p.FileName = "unknown", links[i].ID
 		}
-		p.DirName, p.FileName = sanitize(base), sanitize(p.FileName)
+		p.DirName, p.FileName = Sanitize(base), Sanitize(p.FileName)
 
 		idx, ok := index[p.DirName]
 		if !ok {
@@ -66,8 +66,8 @@ func Groups(links []Link) []Group {
 
 var sanitizeRe = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]`)
 
-// sanitize makes a name safe as a file system path element on any platform.
-func sanitize(s string) string {
+// Sanitize makes a name safe as a file system path element on any platform.
+func Sanitize(s string) string {
 	return strings.TrimSpace(sanitizeRe.ReplaceAllString(s, "_"))
 }
 
