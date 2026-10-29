@@ -16,11 +16,13 @@ const (
 	BrightColor = "#e5e7eb"
 )
 
-// Styles used by the plain renderer. The accent styles are reserved for the
-// interactive renderer and the splash art.
+// Styles used by the plain and interactive renderers. The accent styles are
+// reserved for the splash art and the aggregate line.
 var (
-	styleOk   = lipgloss.NewStyle().Foreground(lipgloss.Color(OkColor))
-	styleWarn = lipgloss.NewStyle().Foreground(lipgloss.Color(WarnColor))
-	styleFail = lipgloss.NewStyle().Foreground(lipgloss.Color(FailColor)).Bold(true)
-	styleDim  = lipgloss.NewStyle().Foreground(lipgloss.Color(DimColor))
+	styleAccent = lipgloss.NewStyle().Foreground(lipgloss.Color(Accent)).Bold(true)
+	styleOk     = lipgloss.NewStyle().Foreground(lipgloss.Color(OkColor))
+	styleWarn   = lipgloss.NewStyle().Foreground(lipgloss.Color(WarnColor))
+	styleFail   = lipgloss.NewStyle().Foreground(lipgloss.Color(FailColor)).Bold(true)
+	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color(DimColor))
+	styleHeader = lipgloss.NewStyle().Foreground(lipgloss.Color(BrightColor)).Bold(true)
 )

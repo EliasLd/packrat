@@ -25,6 +25,7 @@ func main() {
 	conc := flag.Int("c", 8, "download concurrency")
 	resolveConc := flag.Int("rc", 3, "resolve concurrency")
 	retries := flag.Int("retries", 5, "attempts per link/part")
+	plain := flag.Bool("plain", false, "force the plain text renderer even on a terminal")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	dryRun := flag.Bool("dry-run", false, "parse the links file and print the planned download layout")
 	flag.Usage = usage
@@ -49,8 +50,7 @@ func main() {
 			DownloadConcurrency: *conc,
 			Retries:             *retries,
 			UserAgent:           fuckingfast.UserAgent,
-			Observe:             ui.Plain(ui.PlainOptions{Out: os.Stdout, Warn: os.Stderr}),
-		})
+		}, *plain)
 	default:
 		usage()
 		os.Exit(2)
@@ -62,7 +62,7 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
-func run(linkFile string, opt engine.Options) {
+func run(linkFile string, opt engine.Options, plain bool) {
 	data, err := os.ReadFile(linkFile)
 	if err != nil {
 		fatal(err)
@@ -72,6 +72,7 @@ func run(linkFile string, opt engine.Options) {
 	for _, issue := range issues {
 		fmt.Fprintf(os.Stderr, "links:%d: %s\n", issue.Line, issue.Reason)
 	}
+	groups := link.Groups(links)
 
 	resolver, err := fuckingfast.New()
 	if err != nil {
@@ -80,12 +81,25 @@ func run(linkFile string, opt engine.Options) {
 	registry := host.NewRegistry(resolver)
 
 	// ctrl-c cancels the pipeline; partial downloads stay as .part files
-	// and a rerun resumes them
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// and a rerun resumes them. cancel is exposed to the interactive
+	// renderer for the stop key.
+	outer, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	ctx, cancel := context.WithCancel(outer)
+	defer cancel()
+
+	var wait func()
+	opt.Observe = ui.Plain(ui.PlainOptions{Out: os.Stdout, Warn: os.Stderr})
+	if !plain && ui.IsTerminal(os.Stdout) {
+		opt.Observe, wait = ui.Interactive(ui.InteractiveOptions{Out: os.Stdout, Cancel: cancel})
+	}
 
 	eng := engine.New(registry, opt)
-	if err := eng.Run(ctx, link.Groups(links)); err != nil {
+	err = eng.Run(ctx, groups)
+	if wait != nil { // flush the final frame before reporting the outcome
+		wait()
+	}
+	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "\ninterrupted — rerun the same command to resume")
 		}

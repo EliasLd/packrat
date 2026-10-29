@@ -70,8 +70,14 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 		e.observe(event.Event{Kind: event.RunDone, Stats: &event.Stats{}})
 		return nil
 	}
+
+	plan := make([]event.PlanEntry, 0, len(parts))
+	for _, p := range parts {
+		plan = append(plan, event.PlanEntry{Group: p.DirName, Part: p.ID})
+	}
 	e.observe(event.Event{Kind: event.RunStart,
-		Stats: &event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups)}})
+		Stats: &event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups)},
+		Plan:  plan})
 
 	targets, resolveFails := e.resolveAll(ctx, parts)
 

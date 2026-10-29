@@ -10,8 +10,11 @@ import "time"
 type Kind uint8
 
 const (
-	// RunStart announces a run; Stats carries PartsTotal and GroupsTotal.
+	// RunStart announces a run; Stats carries the totals and Plan the
+	// parts about to run.
 	RunStart Kind = iota
+	// ResolveStart is a part beginning resolution.
+	ResolveStart
 	// ResolveDone is a part resolved to a direct link; Filename is the
 	// target file name the part will download to.
 	ResolveDone
@@ -42,6 +45,13 @@ const (
 	RunDone
 )
 
+// PlanEntry is one part as planned at RunStart so renderers can lay out
+// rows in a stable order before resolution completes.
+type PlanEntry struct {
+	Group string
+	Part  string
+}
+
 // Stats describes a run: used by RunStart (totals only) and RunDone (full).
 type Stats struct {
 	PartsTotal  int
@@ -65,7 +75,8 @@ type Event struct {
 	ResumeAt int64  // byte offset when resuming (DownloadStart)
 	Attempt  int
 	Err      error
-	Stats    *Stats // RunStart and RunDone only
+	Stats    *Stats      // RunStart and RunDone only
+	Plan     []PlanEntry // RunStart only
 }
 
 // Observer consumes events. Emitters call it from concurrent worker
