@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/EliasLd/packrat/internal/download"
+	"github.com/EliasLd/packrat/internal/event"
 )
 
 // archive holds test file content keyed by id.
@@ -22,6 +23,32 @@ var archive = map[string][]byte{
 	"one":   []byte("content-of-file-one-and-some-more-bytes-\r\n\t"),
 	"two":   []byte("another-file-content-with-a-different-length"),
 	"fresh": []byte("the-relink-successor-content!"),
+}
+
+// collector records events for assertions; emitters call it from concurrent
+// goroutines, so it is locked.
+type collector struct {
+	mu     sync.Mutex
+	events []event.Event
+}
+
+func (c *collector) observe(e event.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
+
+// of gives the events of one kind, in arrival order.
+func (c *collector) of(kind event.Kind) []event.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []event.Event
+	for _, e := range c.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func serveFiles(t *testing.T, requests *int) *httptest.Server {
@@ -87,6 +114,7 @@ func target(serverURL, id string) download.Target {
 	return download.Target{
 		URL:      u,
 		PageURL:  u,
+		Part:     id,
 		DirName:  "archive",
 		FileName: id + ".bin",
 	}
@@ -111,10 +139,12 @@ func partPath(dir string, t download.Target) string {
 
 func TestDownload(t *testing.T) {
 	tests := []struct {
-		name  string
-		id    string
-		setup func(t *testing.T, dir string)
-		want  []byte
+		name        string
+		id          string
+		setup       func(t *testing.T, dir string)
+		want        []byte
+		skip        bool  // expected to be skipped without a request
+		startResume int64 // expected DownloadStart resume offset
 	}{
 		{
 			name: "downloads content into the target directory",
@@ -124,6 +154,7 @@ func TestDownload(t *testing.T) {
 		{
 			name: "skips an already downloaded final file",
 			id:   "one",
+			skip: true,
 			setup: func(t *testing.T, dir string) {
 				path := filepath.Join(dir, "archive", "one.bin")
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -136,8 +167,9 @@ func TestDownload(t *testing.T) {
 			want: archive["one"],
 		},
 		{
-			name: "resumes from a partial temp file",
-			id:   "two",
+			name:        "resumes from a partial temp file",
+			id:          "two",
+			startResume: 5,
 			setup: func(t *testing.T, dir string) {
 				path := filepath.Join(dir, "archive", "two.bin.part")
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -160,7 +192,9 @@ func TestDownload(t *testing.T) {
 			}
 
 			tgt := target(server.URL, tt.id)
-			summary := download.New(download.Options{OutDir: dir}).Run(context.Background(), []download.Target{tgt})
+			col := &collector{}
+			summary := download.New(download.Options{OutDir: dir, Observe: col.observe}).
+				Run(context.Background(), []download.Target{tgt})
 
 			if len(summary.Failures) != 0 {
 				t.Fatalf("unexpected failure: %v", summary.Failures[0].Err)
@@ -171,6 +205,27 @@ func TestDownload(t *testing.T) {
 			}
 			if _, err := os.Stat(partPath(dir, tgt)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("temp file should be gone, stat error: %v", err)
+			}
+
+			// event contract: lifecycle kinds, no retries or failures
+			dones, skips, starts := col.of(event.DownloadDone), col.of(event.DownloadSkipped), col.of(event.DownloadStart)
+			if tt.skip {
+				if len(skips) != 1 || len(starts) != 0 || len(dones) != 0 {
+					t.Fatalf("skip case events: done=%d skipped=%d started=%d", len(dones), len(skips), len(starts))
+				}
+			} else {
+				if len(starts) != 1 || starts[0].ResumeAt != tt.startResume {
+					t.Fatalf("start events = %+v, want one with resume offset %d", starts, tt.startResume)
+				}
+				if len(dones) != 1 || dones[0].Size != int64(len(tt.want)) {
+					t.Fatalf("done events = %+v, want one with size %d", dones, len(tt.want))
+				}
+				if len(col.of(event.Progress)) == 0 {
+					t.Fatal("a streamed download must emit progress events")
+				}
+			}
+			if r := col.of(event.DownloadRetry); len(r) != 0 {
+				t.Fatalf("unexpected retry events: %+v", r)
 			}
 		})
 	}
@@ -188,10 +243,15 @@ func TestDownloadSkipsWithoutRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary := download.New(download.Options{OutDir: dir}).Run(context.Background(), []download.Target{tgt})
+	col := &collector{}
+	summary := download.New(download.Options{OutDir: dir, Observe: col.observe}).
+		Run(context.Background(), []download.Target{tgt})
 
 	if summary.Skipped != 1 || summary.Done != 0 {
 		t.Fatalf("summary = %+v, want skipped=1 done=0", summary)
+	}
+	if skips := col.of(event.DownloadSkipped); len(skips) != 1 || skips[0].Size != int64(len(archive["one"])) {
+		t.Fatalf("skipped events = %+v, want one with the file size", skips)
 	}
 	if requests != 0 {
 		t.Fatalf("server saw %d requests, want 0", requests)
@@ -203,8 +263,9 @@ func TestDownloadRetriesAfterTruncatedResponse(t *testing.T) {
 	server := truncateHandler(t, &requests, len(archive["one"])/2)
 	dir := t.TempDir()
 	tgt := target(server.URL, "one")
+	col := &collector{}
 
-	summary := download.New(download.Options{OutDir: dir, Retries: 3}).
+	summary := download.New(download.Options{OutDir: dir, Retries: 3, Observe: col.observe}).
 		Run(context.Background(), []download.Target{tgt})
 
 	if len(summary.Failures) != 0 {
@@ -216,6 +277,10 @@ func TestDownloadRetriesAfterTruncatedResponse(t *testing.T) {
 	}
 	if requests < 2 {
 		t.Fatalf("truncation did not trigger a resumed retry, requests=%d", requests)
+	}
+	retries := col.of(event.DownloadRetry)
+	if len(retries) != 1 || retries[0].Attempt != 1 {
+		t.Fatalf("retry events = %+v, want exactly the failed attempt 1", retries)
 	}
 }
 
@@ -237,9 +302,11 @@ func TestDownloadRelinksExpiredLinks(t *testing.T) {
 	dir := t.TempDir()
 	tgt := target(server.URL, "gone-id")
 	relinked := 0
+	col := &collector{}
 
 	dl := download.New(download.Options{
-		OutDir: dir,
+		OutDir:  dir,
+		Observe: col.observe,
 		Relink: func(ctx context.Context, t download.Target) (*url.URL, error) {
 			relinked++
 			return url.Parse(server.URL + "/fresh")
@@ -252,6 +319,10 @@ func TestDownloadRelinksExpiredLinks(t *testing.T) {
 	}
 	if relinked != 1 {
 		t.Fatalf("relink calls = %d, want 1", relinked)
+	}
+	retries := col.of(event.DownloadRetry)
+	if len(retries) != 1 || retries[0].Attempt != 1 || !errors.Is(retries[0].Err, download.ErrLinkExpired) {
+		t.Fatalf("retry events = %+v, want one ErrLinkExpired retry for attempt 1", retries)
 	}
 	got := readFile(t, filepath.Join(dir, tgt.DirName, tgt.FileName))
 	if string(got) != string(archive["fresh"]) {
@@ -268,8 +339,9 @@ func TestDownloadReportsExpiredWithoutRelinker(t *testing.T) {
 	t.Cleanup(server.Close)
 	dir := t.TempDir()
 	tgt := target(server.URL, "one")
+	col := &collector{}
 
-	summary := download.New(download.Options{OutDir: dir, Retries: 2}).
+	summary := download.New(download.Options{OutDir: dir, Retries: 2, Observe: col.observe}).
 		Run(context.Background(), []download.Target{tgt})
 
 	if len(summary.Failures) != 1 {
@@ -280,6 +352,10 @@ func TestDownloadReportsExpiredWithoutRelinker(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d, want 2 (one retry)", requests)
+	}
+	fails := col.of(event.DownloadFail)
+	if len(fails) != 1 || !errors.Is(fails[0].Err, download.ErrLinkExpired) {
+		t.Fatalf("failure events = %+v, want one ErrLinkExpired failure", fails)
 	}
 }
 
@@ -309,11 +385,12 @@ func TestDownloadHonorsCanceledContext(t *testing.T) {
 
 	dir := t.TempDir()
 	tgt := target(server.URL, "one")
+	col := &collector{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	summaryCh := make(chan download.Summary, 1)
 	go func() {
-		summaryCh <- download.New(download.Options{OutDir: dir}).Run(ctx, []download.Target{tgt})
+		summaryCh <- download.New(download.Options{OutDir: dir, Observe: col.observe}).Run(ctx, []download.Target{tgt})
 	}()
 
 	select {
@@ -326,6 +403,10 @@ func TestDownloadHonorsCanceledContext(t *testing.T) {
 	summary := <-summaryCh
 	if len(summary.Failures) != 1 || !errors.Is(summary.Failures[0].Err, context.Canceled) {
 		t.Fatalf("summary = %+v, want exactly one context.Canceled failure", summary)
+	}
+	fails := col.of(event.DownloadFail)
+	if len(fails) != 1 || !errors.Is(fails[0].Err, context.Canceled) {
+		t.Fatalf("failure events = %+v, want one context.Canceled failure", fails)
 	}
 	if _, err := os.Stat(finalPath(dir, tgt)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("final file must not exist after cancellation, stat error: %v", err)

@@ -7,10 +7,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"sync"
 
 	"github.com/EliasLd/packrat/internal/engine"
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 	"github.com/EliasLd/packrat/internal/link"
@@ -48,6 +51,7 @@ func main() {
 			DownloadConcurrency: *conc,
 			Retries:             *retries,
 			UserAgent:           fuckingfast.UserAgent,
+			Observe:             textPrinter(os.Stdout, os.Stderr),
 		})
 	default:
 		usage()
@@ -82,12 +86,50 @@ func run(linkFile string, opt engine.Options) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	eng := engine.New(registry, opt, os.Stdout, os.Stderr)
+	eng := engine.New(registry, opt)
 	if err := eng.Run(ctx, link.Groups(links)); err != nil {
 		if ctx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "\ninterrupted — rerun the same command to resume")
 		}
 		fatal(err)
+	}
+}
+
+// textPrinter renders pipeline events as plain text; interim renderer until
+// the styled plain and interactive renderers land.
+func textPrinter(out, warn io.Writer) event.Observer {
+	var mu sync.Mutex
+	return func(e event.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch e.Kind {
+		case event.RunStart:
+			_, _ = fmt.Fprintf(out, "resolving %d part(s) across %d archive group(s)...\n",
+				e.Stats.PartsTotal, e.Stats.GroupsTotal)
+		case event.ResolveDone:
+			_, _ = fmt.Fprintf(out, "  [resolve] %s OK\n", e.Filename)
+		case event.ResolveFail:
+			_, _ = fmt.Fprintf(warn, "  [resolve FAIL] %s: %v\n", e.Part, e.Err)
+		case event.DownloadStart:
+			if e.ResumeAt > 0 {
+				_, _ = fmt.Fprintf(out, "  [resum] %s continuing at %s\n", e.Part, event.HumanBytes(e.ResumeAt))
+			}
+		case event.DownloadRetry:
+			_, _ = fmt.Fprintf(warn, "  [retry] %s: %v\n", e.Part, e.Err)
+		case event.DownloadDone:
+			_, _ = fmt.Fprintf(out, "  [done] %s (%s)\n", e.Part, event.HumanBytes(e.Size))
+		case event.DownloadSkipped:
+			_, _ = fmt.Fprintf(out, "  [skip] %s already present (%s)\n", e.Part, event.HumanBytes(e.Size))
+		case event.DownloadFail:
+			_, _ = fmt.Fprintf(warn, "  [FAIL] %s: %v\n", e.Part, e.Err)
+		case event.RunDone:
+			if e.Stats.PartsTotal == 0 {
+				_, _ = fmt.Fprintln(out, "no links to process")
+				return
+			}
+			_, _ = fmt.Fprintf(out, "done: %d/%d part(s) downloaded, %d skipped, %d failed\n",
+				e.Stats.Done, e.Stats.PartsTotal, e.Stats.Skipped, e.Stats.Failed)
+		}
 	}
 }
 

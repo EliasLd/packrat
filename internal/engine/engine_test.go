@@ -4,16 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/EliasLd/packrat/internal/engine"
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/link"
 )
@@ -69,6 +70,32 @@ func testGroups() []link.Group {
 	}
 }
 
+// collector records events for assertions; emitters call it from concurrent
+// goroutines, so it is locked.
+type collector struct {
+	mu     sync.Mutex
+	events []event.Event
+}
+
+func (c *collector) observe(e event.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
+
+// of gives the events of one kind, in arrival order.
+func (c *collector) of(kind event.Kind) []event.Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []event.Event
+	for _, e := range c.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func serveContent(t *testing.T) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -90,8 +117,8 @@ func TestEngineRun(t *testing.T) {
 	dir := t.TempDir()
 	registry := host.NewRegistry(&fakeHost{serverURL: server.URL})
 
-	var out, warn strings.Builder
-	eng := engine.New(registry, engine.Options{OutDir: dir, UserAgent: "test-agent"}, &out, &warn)
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, UserAgent: "test-agent", Observe: col.observe})
 
 	if err := eng.Run(context.Background(), testGroups()); err != nil {
 		t.Fatalf("Run() error: %v", err)
@@ -117,11 +144,56 @@ func TestEngineRun(t *testing.T) {
 			t.Fatalf("%s content mismatch: %q != %q", target, got, want.content)
 		}
 	}
-	if !strings.Contains(out.String(), "Game-Archive.part1.rar OK") || !strings.Contains(out.String(), "done: 3/3") {
-		t.Fatalf("output missing event lines:\n%s", out.String())
+
+	starts := col.of(event.RunStart)
+	if len(starts) != 1 || starts[0].Stats.PartsTotal != 3 || starts[0].Stats.GroupsTotal != 2 {
+		t.Fatalf("run start events = %+v, want one start for 3 parts in 2 groups", starts)
 	}
-	if warn.String() != "" {
-		t.Fatalf("unexpected warnings:\n%s", warn.String())
+	if len(col.of(event.ResolveDone)) != 3 || len(col.of(event.ResolveFail)) != 0 {
+		t.Fatalf("resolve events: done=%d fail=%d, want 3 done and none failed",
+			len(col.of(event.ResolveDone)), len(col.of(event.ResolveFail)))
+	}
+	if len(col.of(event.DownloadDone)) != 3 || len(col.of(event.DownloadFail)) != 0 {
+		t.Fatalf("download events: done=%d fail=%d, want 3 done and none failed",
+			len(col.of(event.DownloadDone)), len(col.of(event.DownloadFail)))
+	}
+	dones := col.of(event.RunDone)
+	if len(dones) != 1 || dones[0].Stats.Done != 3 || dones[0].Stats.Failed != 0 {
+		t.Fatalf("run done events = %+v, want one with done=3 failed=0", dones)
+	}
+}
+
+func TestEnginePartIdentityCarriesToDownloads(t *testing.T) {
+	server := serveContent(t)
+	dir := t.TempDir()
+	registry := host.NewRegistry(&fakeHost{serverURL: server.URL})
+
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
+	if err := eng.Run(context.Background(), testGroups()); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+
+	for _, part := range []string{"part1", "part2", "bonus"} {
+		var resolved bool
+		for _, e := range col.of(event.ResolveDone) {
+			if e.Part == part {
+				resolved = true
+			}
+		}
+		if !resolved {
+			t.Fatalf("part %s never resolved", part)
+		}
+		started := col.of(event.DownloadStart)
+		var found bool
+		for _, e := range started {
+			if e.Part == part {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("download events lost the part identity %s", part)
+		}
 	}
 }
 
@@ -130,8 +202,8 @@ func TestEngineKeepsGoingWhenResolveFails(t *testing.T) {
 	dir := t.TempDir()
 	registry := host.NewRegistry(&fakeHost{serverURL: server.URL, failIDs: map[string]bool{"part1": true}})
 
-	var out, warn strings.Builder
-	eng := engine.New(registry, engine.Options{OutDir: dir}, &out, &warn)
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
 
 	err := eng.Run(context.Background(), testGroups())
 	if err == nil {
@@ -140,8 +212,9 @@ func TestEngineKeepsGoingWhenResolveFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "1 part(s) failed") {
 		t.Fatalf("Run() error = %v, want failure count", err)
 	}
-	if !strings.Contains(warn.String(), "[resolve FAIL] part1") {
-		t.Fatalf("warnings missing resolve failure:\n%s", warn.String())
+	fails := col.of(event.ResolveFail)
+	if len(fails) != 1 || fails[0].Part != "part1" {
+		t.Fatalf("resolve failure events = %+v, want part1", fails)
 	}
 	// the two healthy parts must still be on disk, named after their fragments
 	for _, rel := range []string{filepath.Join("Game-Archive", "Game-Archive.part2.rar"), filepath.Join("Extra", "Extra.bonus.rar")} {
@@ -164,8 +237,8 @@ func TestEngineUsesHostFilenameWithoutFragment(t *testing.T) {
 			},
 		},
 	}
-	var out, warn strings.Builder
-	eng := engine.New(registry, engine.Options{OutDir: dir}, &out, &warn)
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
 	if err := eng.Run(context.Background(), groups); err != nil {
 		t.Fatalf("Run() error: %v", err)
 	}
@@ -177,17 +250,25 @@ func TestEngineUsesHostFilenameWithoutFragment(t *testing.T) {
 	if string(got) != files()["part1"] {
 		t.Fatal("content mismatch")
 	}
+	// the resolve event must carry the host-provided name for display
+	dones := col.of(event.ResolveDone)
+	if len(dones) != 1 || dones[0].Filename != "titled-part1.bin" {
+		t.Fatalf("resolve done events = %+v, want the host filename", dones)
+	}
 }
 
-// ensure the resolve phase really runs concurrently and stops cleanly
 func TestEngineEmptyInput(t *testing.T) {
 	registry := host.NewRegistry(&fakeHost{serverURL: "http://127.0.0.1:1"})
-	var out strings.Builder
-	eng := engine.New(registry, engine.Options{}, &out, io.Discard)
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{Observe: col.observe})
 	if err := eng.Run(context.Background(), nil); err != nil {
 		t.Fatalf("Run(nil groups) must be a no-op success, got %v", err)
 	}
-	if !strings.Contains(out.String(), "no links to process") {
-		t.Fatalf("unexpected output: %q", out.String())
+	dones := col.of(event.RunDone)
+	if len(dones) != 1 || dones[0].Stats.PartsTotal != 0 {
+		t.Fatalf("run done events = %+v, want one empty summary", dones)
+	}
+	if len(col.of(event.RunStart)) != 0 {
+		t.Fatal("an empty run must not start")
 	}
 }
