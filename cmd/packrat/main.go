@@ -129,12 +129,8 @@ func run(ctx context.Context, cancel context.CancelFunc, linkFile string, opt en
 	}
 	groups := link.Groups(links)
 
-	resolver, err := fuckingfast.New()
-	if err != nil {
-		return err
-	}
-	registry := host.NewRegistry(resolver)
-
+	// the renderer owns the observer; the resolver relays the same stream
+	// so its rate-limit cooling shows up next to the parts' events
 	var wait func()
 	opt.Observe = ui.Plain(ui.PlainOptions{Out: os.Stdout, Warn: os.Stderr})
 	if !plain && ui.IsTerminal(os.Stdout) {
@@ -158,6 +154,12 @@ func run(ctx context.Context, cancel context.CancelFunc, linkFile string, opt en
 		})
 		opt.Observe = obs
 	}
+
+	resolver, err := fuckingfast.New(fuckingfast.WithObserve(opt.Observe))
+	if err != nil {
+		return err
+	}
+	registry := host.NewRegistry(resolver)
 
 	eng := engine.New(registry, opt)
 	err = eng.Run(ctx, groups)

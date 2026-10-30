@@ -7,12 +7,14 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	bhttp "github.com/bogdanfinn/fhttp"
 
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 )
@@ -288,6 +290,70 @@ func TestRateLimitResponses(t *testing.T) {
 			t.Fatal("404 must not count as a rate limit")
 		}
 	})
+}
+
+// eventLog records events emitted by the resolver itself.
+type eventLog struct {
+	mu     sync.Mutex
+	events []event.Event
+}
+
+func (l *eventLog) observe(e event.Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, e)
+}
+
+func (l *eventLog) of(kind event.Kind) []event.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []event.Event
+	for _, e := range l.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestResolverReportsCooldowns(t *testing.T) {
+	pageURL, err := url.Parse(pageURLText)
+	if err != nil {
+		t.Fatalf("test url: %v", err)
+	}
+
+	var waits []time.Duration
+	log := &eventLog{}
+	h, err := fuckingfast.New(
+		fuckingfast.WithHTTPClient(&fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+		}}),
+		fuckingfast.WithBaseDelay(time.Millisecond),
+		fuckingfast.WithMinRequestInterval(0),
+		fuckingfast.WithSleep(func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		}),
+		fuckingfast.WithObserve(log.observe),
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	_, resolveErr := h.Resolve(context.Background(), pageURL)
+	if !errors.Is(resolveErr, host.ErrRateLimited) {
+		t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", resolveErr)
+	}
+	cooldowns := log.of(event.Cooling)
+	if len(cooldowns) != 2 { // one before each of the two retried waits
+		t.Fatalf("cooldown events = %d, want one per imposed pause (%v)", len(cooldowns), waits)
+	}
+	if cooldowns[0].Wait != 30*time.Second {
+		t.Fatalf("cooldown waits = %v, want the host-mandated 30s", cooldowns[0].Wait)
+	}
+	if cooldowns[0].Err == nil || cooldowns[0].Err.Error() != "host rate limit (status 429): retry after 30s" {
+		t.Fatalf("cooldown reason = %v, want the typed rate limit", cooldowns[0].Err)
+	}
 }
 
 func TestMatches(t *testing.T) {

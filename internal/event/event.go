@@ -38,6 +38,10 @@ const (
 	// DownloadFail is a target that gave up after all its attempts; Err
 	// carries the last error, Attempt the attempts used.
 	DownloadFail
+	// Cooling reports the host asked for a back off and the pipeline
+	// decided to wait: Wait carries the pause, Err details the signal.
+	// Emitted before the wait, once per imposed pause.
+	Cooling
 	// RunPaused and RunResumed mark user pause/resume of the downloads.
 	RunPaused
 	RunResumed
@@ -75,8 +79,9 @@ type Event struct {
 	ResumeAt int64  // byte offset when resuming (DownloadStart)
 	Attempt  int
 	Err      error
-	Stats    *Stats      // RunStart and RunDone only
-	Plan     []PlanEntry // RunStart only
+	Wait     time.Duration // back off imposed before the next request (Cooling)
+	Stats    *Stats        // RunStart and RunDone only
+	Plan     []PlanEntry   // RunStart only
 }
 
 // Observer consumes events. Emitters call it from concurrent worker

@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/EliasLd/packrat/internal/event"
 )
 
 // defaultRequestInterval keeps the resolver from bursting: no two requests
@@ -95,3 +97,8 @@ func WithSleep(s sleeper) Option {
 		h.limiter.sleep = s
 	}
 }
+
+// WithObserve relays events from the resolver: the cooldowns a rate-limited
+// host imposes, so renderers can show them alongside the pipeline's own
+// events. Nil (default) emits nothing.
+func WithObserve(o event.Observer) Option { return func(h *Host) { h.observe = o } }

@@ -23,6 +23,7 @@ import (
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 )
 
@@ -154,6 +155,7 @@ type Host struct {
 	retries   int
 	limiter   *requestLimiter
 	sleep     sleeper // limiter slots and rate-limit waits share one seam
+	observe   event.Observer
 	baseDelay time.Duration
 }
 
@@ -231,6 +233,9 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 			var giveUp bool
 			if wait, giveUp = limitWait(limited.RetryAfter, attempt, limitStreak); giveUp {
 				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, limited)
+			}
+			if h.observe != nil {
+				h.observe(event.Event{Kind: event.Cooling, Err: limited, Wait: wait})
 			}
 		} else {
 			limitStreak = 0

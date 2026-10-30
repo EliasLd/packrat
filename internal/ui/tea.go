@@ -127,6 +127,10 @@ type interactive struct {
 	paused  bool
 	failure []failedPart
 
+	cooldownWait time.Duration // the pause the host imposed
+	cooldownAt   time.Time     // when it started, read on the model clock
+	coolWhy      string        // what the host said
+
 	partsTotal, groupsTotal int
 	resolved                int
 	downloadsStarted        int
@@ -285,6 +289,8 @@ func (m *interactive) apply(e event.Event) (tea.Model, tea.Cmd) {
 			}
 			m.aggDelta, m.aggAt = 0, now
 		}
+	case event.Cooling:
+		m.cooldownWait, m.cooldownAt, m.coolWhy = e.Wait, m.now(), errText(e.Err)
 	case event.RunDone:
 		m.stats = e.Stats
 		return m, tea.Quit
@@ -389,6 +395,10 @@ func (m *interactive) View() string {
 		_, _ = fmt.Fprintf(&b, "  %s\n", styleDim.Render(fmt.Sprintf("%d more queued", queued)))
 	}
 
+	if line := m.coolingLine(); line != "" {
+		b.WriteString(line)
+	}
+
 	for _, f := range m.failure {
 		_, _ = fmt.Fprintf(&b, "%s %s — %s\n", styleFail.Render("[fail]"), f.name, f.reason)
 	}
@@ -430,6 +440,15 @@ func (m *interactive) rowView(r *row) string {
 }
 
 const nameMax = 22
+
+// coolingLine renders the host-mandated pause while it lasts; it appears
+// among the failed parts and expires from the frame once the wait is over.
+func (m *interactive) coolingLine() string {
+	if m.cooldownWait <= 0 || m.now().Sub(m.cooldownAt) >= m.cooldownWait {
+		return ""
+	}
+	return fmt.Sprintf("  %s cooling %v: %s\n", styleWarn.Render("[rate limit]"), m.cooldownWait, m.coolWhy)
+}
 
 // statsLine is the run's memory under the bars: global percentage, parts
 // completed over total, bytes, speed, elapsed time and failures.
