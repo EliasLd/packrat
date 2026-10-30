@@ -26,3 +26,11 @@ var (
 	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color(DimColor))
 	styleHeader = lipgloss.NewStyle().Foreground(lipgloss.Color(BrightColor)).Bold(true)
 )
+
+// Text helpers shape the entry point's usage and error strings with the same
+// palette as the run views. lipgloss degrades to plain text on a
+// non-terminal stdout and honors NO_COLOR, so callers stay unconditional.
+func AccentText(s string) string { return styleAccent.Render(s) }
+func DimText(s string) string    { return styleDim.Render(s) }
+func WarnText(s string) string   { return styleWarn.Render(s) }
+func FailText(s string) string   { return styleFail.Render(s) }
