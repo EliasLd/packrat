@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,48 @@ var (
 	hxPostRe = regexp.MustCompile(`hx-post\s*=\s*"([^"]+)"`)
 	titleRe  = regexp.MustCompile(`(?s)<title>(.*?)</title>`)
 )
+
+// limitPhrases are the markers a rate-limit or IP-block page leaves in its
+// body even when it answers status 200. Deliberately short and specific.
+var limitPhrases = []string{"rate limit", "rate-limit", "ratelimit", "too many requests"}
+
+// parseRetryAfter reads a Retry-After header; only the seconds form is
+// supported, HTTP-date responses count as unknown.
+func parseRetryAfter(v string) (time.Duration, bool) {
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0, false
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+// hasLimitPhrase reports whether the body looks like a rate-limit page.
+func hasLimitPhrase(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	for _, phrase := range limitPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+// rateLimited reports a "back off" signal from a failed exchange. The
+// response carrying a Retry-After header always wins, then the explicit
+// limit statuses, then the body sniff as the last resort for app-level
+// limits that answer status 200.
+func rateLimited(status int, retryAfter string, body []byte) *host.RateLimitedError {
+	if ra, ok := parseRetryAfter(retryAfter); ok {
+		return &host.RateLimitedError{RetryAfter: ra, Detail: fmt.Sprintf("status %d", status)}
+	}
+	if status == bhttp.StatusTooManyRequests || status == bhttp.StatusForbidden || status == bhttp.StatusServiceUnavailable {
+		return &host.RateLimitedError{Detail: fmt.Sprintf("status %d", status)}
+	}
+	if len(body) > 0 && hasLimitPhrase(body) {
+		return &host.RateLimitedError{Detail: "page suggests rate limiting"}
+	}
+	return nil
+}
 
 // HTTPClient abstracts the underlying transport so tools and tests can swap
 // the fingerprinted client for fakes or alternate fingerprints.
@@ -180,6 +223,9 @@ func fetchPage(ctx context.Context, client HTTPClient, pageURL *url.URL) ([]byte
 		return nil, fmt.Errorf("read page: %w", err)
 	}
 	if resp.StatusCode != bhttp.StatusOK {
+		if limited := rateLimited(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
+			return nil, limited
+		}
 		return nil, fmt.Errorf("download page status %d", resp.StatusCode)
 	}
 	return body, nil
@@ -187,9 +233,17 @@ func fetchPage(ctx context.Context, client HTTPClient, pageURL *url.URL) ([]byte
 
 // parsePage extracts the download endpoint and the file name. This host puts
 // the file name in the page title.
+//
+// When the button is missing the body is checked for rate-limit markers
+// first: a block page answers status 200 just like a healthy landing page,
+// and misreading it as a permanent layout change would make the engine give
+// up on every part while the block is merely asking for patience.
 func parsePage(body []byte, pageURL *url.URL) (endpoint, filename string, err error) {
 	m := hxPostRe.FindSubmatch(body)
 	if m == nil {
+		if hasLimitPhrase(body) {
+			return "", "", &host.RateLimitedError{Detail: "page suggests rate limiting"}
+		}
 		return "", "", fmt.Errorf("%w (page %s)", ErrLayoutChanged, pageURL.Redacted())
 	}
 	endpoint = string(m[1])
@@ -221,6 +275,9 @@ func triggerDownload(ctx context.Context, client HTTPClient, endpoint string, re
 		return direct, nil
 	}
 	body, _ := io.ReadAll(resp.Body)
+	if limited := rateLimited(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
+		return "", limited
+	}
 	return "", fmt.Errorf("%w: status %d, body %.80s", ErrNoDirectLink, resp.StatusCode, body)
 }
 

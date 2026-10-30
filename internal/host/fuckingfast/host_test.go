@@ -22,6 +22,9 @@ var pageValid string
 //go:embed testdata/page_broken.html
 var pageBroken string
 
+//go:embed testdata/page_rate_limit.html
+var pageRateLimit string
+
 const (
 	pageURLText  = "https://fuckingfast.co/abc123"
 	endpointText = "https://fuckingfast.co/f/abc123/go"
@@ -169,6 +172,101 @@ func TestResolve(t *testing.T) {
 		}
 		if handler.calls != 0 {
 			t.Fatalf("calls = %d, want 0", handler.calls)
+		}
+	})
+}
+
+func TestRateLimitResponses(t *testing.T) {
+	pageURL, err := url.Parse(pageURLText)
+	if err != nil {
+		t.Fatalf("test url: %v", err)
+	}
+
+	t.Run("a 200 page with limit text is a rate limit, not a layout change", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(200, nil, pageRateLimit), nil
+		}}
+		h := resolvedHost(t, handler)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if errors.Is(err, fuckingfast.ErrLayoutChanged) {
+			t.Fatal("a rate limit page must never be reported as a layout change")
+		}
+		if !strings.Contains(err.Error(), "page suggests rate limiting") {
+			t.Fatalf("Resolve() error = %v, want the limiting detail", err)
+		}
+	})
+
+	t.Run("status 429 carries the parsed Retry-After", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+		}}
+		h := resolvedHost(t, handler)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		var limited *host.RateLimitedError
+		if !errors.As(err, &limited) {
+			t.Fatalf("Resolve() error = %v, want a *host.RateLimitedError", err)
+		}
+		if limited.RetryAfter != 30*time.Second {
+			t.Fatalf("RetryAfter = %v, want 30s", limited.RetryAfter)
+		}
+		if !strings.Contains(err.Error(), "retry after 30s") {
+			t.Fatalf("Resolve() error = %v, want the retry hint in the text", err)
+		}
+	})
+
+	t.Run("status 503 on the download endpoint is limiting too", func(t *testing.T) {
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			if req.Method == bhttp.MethodGet {
+				return makeResponse(200, nil, pageValid), nil
+			}
+			return makeResponse(503, nil, ""), nil
+		}}
+		h := resolvedHost(t, handler)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if handler.calls != 6 {
+			t.Fatalf("calls = %d, want 6", handler.calls)
+		}
+	})
+
+	t.Run("a 200 download answer with limit text is limiting", func(t *testing.T) {
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			if req.Method == bhttp.MethodGet {
+				return makeResponse(200, nil, pageValid), nil
+			}
+			return makeResponse(200, nil, "you hit the rate limit, calm down"), nil
+		}}
+		h := resolvedHost(t, handler)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if errors.Is(err, fuckingfast.ErrNoDirectLink) {
+			t.Fatal("a limit message must not be confused with a missing direct link")
+		}
+	})
+
+	t.Run("an unrecognized failure keeps the old plain error", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(404, nil, "not found"), nil
+		}}
+		h := resolvedHost(t, handler)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if err == nil || !strings.Contains(err.Error(), "download page status 404") {
+			t.Fatalf("Resolve() error = %v, want the plain status error", err)
+		}
+		if errors.Is(err, host.ErrRateLimited) {
+			t.Fatal("404 must not count as a rate limit")
 		}
 	})
 }
