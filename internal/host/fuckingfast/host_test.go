@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,11 +36,11 @@ const (
 // fakeClient responds to requests via a configurable handler and counts calls.
 type fakeClient struct {
 	do    func(req *bhttp.Request) (*bhttp.Response, error)
-	calls int
+	calls atomic.Int64 // safe for concurrent Do, as the resolver fans out
 }
 
 func (f *fakeClient) Do(req *bhttp.Request) (*bhttp.Response, error) {
-	f.calls++
+	f.calls.Add(1)
 	return f.do(req)
 }
 
@@ -74,6 +75,8 @@ func resolvedHost(t *testing.T, client *fakeClient) host.Host {
 	h, err := fuckingfast.New(
 		fuckingfast.WithHTTPClient(client),
 		fuckingfast.WithBaseDelay(time.Millisecond),
+		// pacing disabled: this helper must keep the existing tests instant
+		fuckingfast.WithMinRequestInterval(0),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -122,8 +125,8 @@ func TestResolve(t *testing.T) {
 		if !strings.Contains(err.Error(), "resolve after 3 attempt(s)") {
 			t.Fatalf("Resolve() error = %v, want attempts exhausted", err)
 		}
-		if handler.calls != 6 { // 3 page fetches + 3 download posts
-			t.Fatalf("calls = %d, want 6", handler.calls)
+		if handler.calls.Load() != 6 { // 3 page fetches + 3 download posts
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
 		}
 	})
 
@@ -137,8 +140,8 @@ func TestResolve(t *testing.T) {
 		if !errors.Is(err, fuckingfast.ErrLayoutChanged) {
 			t.Fatalf("Resolve() error = %v, want ErrLayoutChanged", err)
 		}
-		if handler.calls != 1 {
-			t.Fatalf("calls = %d, want 1 (no retry on permanent error)", handler.calls)
+		if handler.calls.Load() != 1 {
+			t.Fatalf("calls = %d, want 1 (no retry on permanent error)", handler.calls.Load())
 		}
 	})
 
@@ -155,8 +158,8 @@ func TestResolve(t *testing.T) {
 		if !errors.Is(err, fuckingfast.ErrNoDirectLink) {
 			t.Fatalf("Resolve() error = %v, want ErrNoDirectLink", err)
 		}
-		if handler.calls != 6 {
-			t.Fatalf("calls = %d, want 6", handler.calls)
+		if handler.calls.Load() != 6 {
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
 		}
 	})
 
@@ -170,8 +173,8 @@ func TestResolve(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Resolve() error = %v, want context.Canceled", err)
 		}
-		if handler.calls != 0 {
-			t.Fatalf("calls = %d, want 0", handler.calls)
+		if handler.calls.Load() != 0 {
+			t.Fatalf("calls = %d, want 0", handler.calls.Load())
 		}
 	})
 }
@@ -232,8 +235,8 @@ func TestRateLimitResponses(t *testing.T) {
 		if !errors.Is(err, host.ErrRateLimited) {
 			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
 		}
-		if handler.calls != 6 {
-			t.Fatalf("calls = %d, want 6", handler.calls)
+		if handler.calls.Load() != 6 {
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
 		}
 	})
 

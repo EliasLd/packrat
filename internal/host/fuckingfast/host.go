@@ -113,12 +113,13 @@ func WithBaseDelay(d time.Duration) Option { return func(h *Host) { h.baseDelay 
 type Host struct {
 	client    HTTPClient
 	retries   int
+	limiter   *requestLimiter
 	baseDelay time.Duration
 }
 
 // New builds a Host with the default browser-fingerprinted client.
 func New(opts ...Option) (*Host, error) {
-	h := &Host{retries: 3, baseDelay: time.Second}
+	h := &Host{retries: 3, baseDelay: time.Second, limiter: newRequestLimiter()}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -185,7 +186,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 }
 
 func (h *Host) try(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
-	page, err := fetchPage(ctx, h.client, pageURL)
+	page, err := h.fetchPage(ctx, pageURL)
 	if err != nil {
 		return host.DirectLink{}, err
 	}
@@ -193,7 +194,7 @@ func (h *Host) try(ctx context.Context, pageURL *url.URL) (host.DirectLink, erro
 	if err != nil {
 		return host.DirectLink{}, err
 	}
-	directURL, err := triggerDownload(ctx, h.client, endpoint, pageURL)
+	directURL, err := h.triggerDownload(ctx, endpoint, pageURL)
 	if err != nil {
 		return host.DirectLink{}, err
 	}
@@ -204,7 +205,10 @@ func (h *Host) try(ctx context.Context, pageURL *url.URL) (host.DirectLink, erro
 	return host.DirectLink{URL: direct, Filename: filename}, nil
 }
 
-func fetchPage(ctx context.Context, client HTTPClient, pageURL *url.URL) ([]byte, error) {
+func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) {
+	if err := h.limiter.wait(ctx); err != nil {
+		return nil, err
+	}
 	req, err := bhttp.NewRequestWithContext(ctx, bhttp.MethodGet, pageURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build page request: %w", err)
@@ -213,7 +217,7 @@ func fetchPage(ctx context.Context, client HTTPClient, pageURL *url.URL) ([]byte
 		"User-Agent": {UserAgent},
 		"Accept":     {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
 	}
-	resp, err := client.Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch page: %w", err)
 	}
@@ -256,7 +260,10 @@ func parsePage(body []byte, pageURL *url.URL) (endpoint, filename string, err er
 	return endpoint, filename, nil
 }
 
-func triggerDownload(ctx context.Context, client HTTPClient, endpoint string, referer *url.URL) (string, error) {
+func (h *Host) triggerDownload(ctx context.Context, endpoint string, referer *url.URL) (string, error) {
+	if err := h.limiter.wait(ctx); err != nil {
+		return "", err
+	}
 	req, err := bhttp.NewRequestWithContext(ctx, bhttp.MethodPost, endpoint, nil)
 	if err != nil {
 		return "", fmt.Errorf("build download request: %w", err)
@@ -266,7 +273,7 @@ func triggerDownload(ctx context.Context, client HTTPClient, endpoint string, re
 		"HX-Request": {"true"},
 		"Referer":    {referer.String()},
 	}
-	resp, err := client.Do(req)
+	resp, err := h.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download request: %w", err)
 	}
