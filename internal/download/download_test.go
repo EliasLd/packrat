@@ -440,6 +440,42 @@ func slowServer(t *testing.T, id, content string, numChunks int) *httptest.Serve
 	return server
 }
 
+// shortBodyServer promises the full content length but delivers only the
+// first bytes, then ends the connection: the client must never accept a
+// body shorter than what was reported.
+func shortBodyServer(t *testing.T, requests *int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*requests++
+		full := archive["one"]
+		w.Header().Set("Content-Length", fmt.Sprint(len(full)))
+		_, _ = w.Write(full[:10])
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestDownloadNeverKeepsAFileShorterThanReported(t *testing.T) {
+	var requests int
+	server := shortBodyServer(t, &requests)
+	dir := t.TempDir()
+	tgt := target(server.URL, "one")
+	col := &collector{}
+
+	summary := download.New(download.Options{OutDir: dir, Retries: 2, Observe: col.observe}).
+		Run(context.Background(), []download.Target{tgt})
+
+	if len(summary.Failures) != 1 || !strings.Contains(summary.Failures[0].Err.Error(), "giving up after 2 attempt(s)") {
+		t.Fatalf("summary = %+v, want one giving-up failure after the retry budget", summary)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if _, err := os.Stat(finalPath(dir, tgt)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a short body must never be renamed into the final file, stat error: %v", err)
+	}
+}
+
 func TestGateBlocksStartupUntilResumed(t *testing.T) {
 	var requests int
 	server := serveFiles(t, &requests)

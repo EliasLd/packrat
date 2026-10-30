@@ -257,6 +257,33 @@ func TestEngineUsesHostFilenameWithoutFragment(t *testing.T) {
 	}
 }
 
+func TestEngineNothingToDownloadWhenEveryResolveFails(t *testing.T) {
+	server := serveContent(t)
+	dir := t.TempDir()
+	registry := host.NewRegistry(&fakeHost{
+		serverURL: server.URL,
+		failIDs:   map[string]bool{"part1": true, "part2": true, "bonus": true},
+	})
+
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
+
+	err := eng.Run(context.Background(), testGroups())
+	if err == nil || !strings.Contains(err.Error(), "3 part(s) failed to resolve, nothing to download") {
+		t.Fatalf("Run() error = %v, want the nothing-to-download message", err)
+	}
+	if len(col.of(event.ResolveFail)) != 3 {
+		t.Fatalf("resolve failure events = %d, want one per part", len(col.of(event.ResolveFail)))
+	}
+	if len(col.of(event.DownloadStart)) != 0 {
+		t.Fatal("no downloads may start when every resolve fails")
+	}
+	dones := col.of(event.RunDone)
+	if len(dones) != 1 || dones[0].Stats.Done != 0 || dones[0].Stats.Failed != 3 {
+		t.Fatalf("run done events = %+v, want done=0 failed=3", dones)
+	}
+}
+
 func TestEngineEmptyInput(t *testing.T) {
 	registry := host.NewRegistry(&fakeHost{serverURL: "http://127.0.0.1:1"})
 	col := &collector{}
