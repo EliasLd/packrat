@@ -35,6 +35,45 @@ var ErrLayoutChanged = errors.New("download button markup not found")
 // It is treated as transient and retried.
 var ErrNoDirectLink = errors.New("no direct download link returned")
 
+// Rate-limit wait policy: waits requested by the host are clamped into
+// [limitWaitMin, limitWaitMax]; a Retry-After above the cap, or
+// limitGiveUp limiting answers in a row inside one Resolve, abandons the
+// link instead of camping on a host that asked for minutes.
+const (
+	limitWaitMin    = 2 * time.Second
+	limitWaitMax    = time.Minute
+	limitGiveUp     = 3
+	limitLadderBase = 5 * time.Second
+)
+
+// limitWait decides the pause after a rate-limit answer and whether the
+// link should be abandoned instead. A Retry-After wins over the ladder; a
+// streak of limiting answers (attempt failures, not resets) triggers the
+// give-up so a long block ends fast and visibly.
+func limitWait(retryAfter time.Duration, attempt, streak int) (time.Duration, bool) {
+	if retryAfter > limitWaitMax || streak >= limitGiveUp {
+		return 0, true
+	}
+	if retryAfter > 0 {
+		return clampLimitWait(retryAfter), false
+	}
+	wait := limitLadderBase
+	for i := 1; i < attempt; i++ {
+		wait *= 3
+	}
+	return clampLimitWait(wait), false
+}
+
+func clampLimitWait(d time.Duration) time.Duration {
+	if d < limitWaitMin {
+		return limitWaitMin
+	}
+	if d > limitWaitMax {
+		return limitWaitMax
+	}
+	return d
+}
+
 // UserAgent is the browser user agent sent with requests to this host,
 // covering both landing page fetches and direct downloads.
 const UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
@@ -114,12 +153,13 @@ type Host struct {
 	client    HTTPClient
 	retries   int
 	limiter   *requestLimiter
+	sleep     sleeper // limiter slots and rate-limit waits share one seam
 	baseDelay time.Duration
 }
 
 // New builds a Host with the default browser-fingerprinted client.
 func New(opts ...Option) (*Host, error) {
-	h := &Host{retries: 3, baseDelay: time.Second, limiter: newRequestLimiter()}
+	h := &Host{retries: 3, baseDelay: time.Second, limiter: newRequestLimiter(), sleep: sleepFor}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -166,6 +206,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 		return host.DirectLink{}, errors.New("page URL is nil")
 	}
 	var lastErr error
+	var limitStreak int
 	for attempt := 1; attempt <= h.retries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return host.DirectLink{}, err
@@ -178,11 +219,34 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 			return host.DirectLink{}, err
 		}
 		lastErr = err
-		if waitErr := sleepContext(ctx, h.baseDelay*time.Duration(attempt)); waitErr != nil {
+
+		// ordinary transient failures keep the small per-attempt backoff;
+		// rate limit answers replace it with the host-mandated pause and
+		// may end the retries outright (see limitWait). A streak resets on
+		// any non-limit failure so an unrelated blip cannot trigger it.
+		wait := h.baseDelay * time.Duration(attempt)
+		var limited *host.RateLimitedError
+		if errors.As(err, &limited) {
+			limitStreak++
+			var giveUp bool
+			if wait, giveUp = limitWait(limited.RetryAfter, attempt, limitStreak); giveUp {
+				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, limited)
+			}
+		} else {
+			limitStreak = 0
+			wait = jitterUp(wait) // the ordinary backoff keeps its breathing fuzz
+		}
+		if waitErr := h.sleep(ctx, wait); waitErr != nil {
 			return host.DirectLink{}, waitErr
 		}
 	}
 	return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", h.retries, lastErr)
+}
+
+// jitterUp widens a wait by up to 25 percent, upward only. The ordinary
+// per-attempt backoff uses it so waits never repeat a uniform rhythm.
+func jitterUp(d time.Duration) time.Duration {
+	return d + time.Duration(rand.Int63n(int64(d/4+1)))
 }
 
 func (h *Host) try(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
@@ -286,14 +350,4 @@ func (h *Host) triggerDownload(ctx context.Context, endpoint string, referer *ur
 		return "", limited
 	}
 	return "", fmt.Errorf("%w: status %d, body %.80s", ErrNoDirectLink, resp.StatusCode, body)
-}
-
-func sleepContext(ctx context.Context, d time.Duration) error {
-	jitter := time.Duration(rand.Int63n(int64(d/4 + 1)))
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d + jitter):
-		return nil
-	}
 }

@@ -87,5 +87,11 @@ func WithClock(now func() time.Time) Option {
 	return func(h *Host) { h.limiter.now = now }
 }
 
-// WithSleep replaces how waits are performed (tests).
-func WithSleep(s sleeper) Option { return func(h *Host) { h.limiter.sleep = s } }
+// WithSleep replaces how waits are performed, for both the limiter's slot
+// spacing and the rate-limit waits (tests).
+func WithSleep(s sleeper) Option {
+	return func(h *Host) {
+		h.sleep = s
+		h.limiter.sleep = s
+	}
+}
