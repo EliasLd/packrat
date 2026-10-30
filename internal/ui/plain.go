@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,6 +45,7 @@ type plain struct {
 	skipped    int
 	failed     int
 	partsTotal int
+	failures   []failedPart // every resolve/download failure, for the recap
 
 	aggregate   int64     // bytes summed over active parts
 	aggregateAt time.Time // when the aggregate line was last printed
@@ -67,6 +69,7 @@ func (p *plain) observe(e event.Event) {
 		_, _ = fmt.Fprintf(p.opt.Out, "  %s %s\n", styleOk.Render("[resolve]"), name(e))
 	case event.ResolveFail:
 		p.endLine()
+		p.failures = append(p.failures, failedPart{name: name(e), reason: errText(e.Err)})
 		_, _ = fmt.Fprintf(p.opt.Warn, "  %s %s: %v\n", styleFail.Render("[resolve FAIL]"), name(e), e.Err)
 	case event.DownloadStart:
 		p.endLine()
@@ -100,6 +103,7 @@ func (p *plain) observe(e event.Event) {
 	case event.DownloadFail:
 		delete(p.active, e.Part)
 		p.failed++
+		p.failures = append(p.failures, failedPart{name: name(e), reason: errText(e.Err)})
 		p.endLine()
 		_, _ = fmt.Fprintf(p.opt.Warn, "  %s %s: %v\n", styleFail.Render("[FAIL]"), name(e), e.Err)
 	case event.RunPaused:
@@ -163,6 +167,36 @@ func (p *plain) finish(stats *event.Stats) {
 		rate := event.HumanBytes(int64(float64(stats.Bytes) / stats.Elapsed.Seconds()))
 		_, _ = fmt.Fprintf(p.opt.Out, "      %s in %.1fs @ %s/s\n",
 			event.HumanBytes(stats.Bytes), stats.Elapsed.Seconds(), rate)
+	}
+	p.recap()
+}
+
+// recap closes the run with the failures grouped by reason, so a log or CI
+// job shows at a glance why a run ended partially. First-seen reason order
+// is kept, and a reason with many parts lists a few names plus a count.
+func (p *plain) recap() {
+	if len(p.failures) == 0 {
+		return
+	}
+
+	byReason := map[string][]string{}
+	order := make([]string, 0, len(p.failures))
+	for _, f := range p.failures {
+		if _, seen := byReason[f.reason]; !seen {
+			order = append(order, f.reason)
+		}
+		byReason[f.reason] = append(byReason[f.reason], f.name)
+	}
+
+	_, _ = fmt.Fprintln(p.opt.Warn, styleFail.Render("failed parts:"))
+	for _, reason := range order {
+		names := byReason[reason]
+		more := ""
+		if len(names) > 3 {
+			more = fmt.Sprintf(", and %d more", len(names)-3)
+			names = names[:3]
+		}
+		_, _ = fmt.Fprintf(p.opt.Warn, "  %s — %s%s\n", reason, strings.Join(names, ", "), more)
 	}
 }
 

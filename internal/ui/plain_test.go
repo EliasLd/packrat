@@ -82,6 +82,38 @@ func TestPlainThrottlesAggregate(t *testing.T) {
 	}
 }
 
+func TestPlainRecapsFailedPartsGroupedByReason(t *testing.T) {
+	forceAscii(t)
+	var out, warn strings.Builder
+	obs := Plain(PlainOptions{Out: &out, Warn: &warn, ProgressInterval: -time.Second})
+
+	deadline := "giving up after 5 attempt(s): unexpected status 404"
+	for _, e := range []event.Event{
+		{Kind: event.RunStart, Stats: &event.Stats{PartsTotal: 4, GroupsTotal: 1}},
+		{Kind: event.ResolveFail, Part: "p3", Err: errors.New("host says no")},
+		{Kind: event.DownloadFail, Part: "p1", Filename: "f1.rar", Err: errors.New(deadline)},
+		{Kind: event.DownloadFail, Part: "p2", Filename: "f2.rar", Err: errors.New(deadline)},
+		{Kind: event.RunDone, Stats: &event.Stats{
+			PartsTotal: 4, GroupsTotal: 1, Done: 1, Failed: 3, Bytes: 10, Elapsed: time.Second}},
+	} {
+		obs(e)
+	}
+
+	warned := warn.String()
+	if !strings.Contains(warned, "failed parts:") {
+		t.Fatalf("output = %q, want the recap heading", warned)
+	}
+	if !strings.Contains(warned, deadline+" — f1.rar, f2.rar") {
+		t.Fatalf("output = %q, want the same-reason parts grouped", warned)
+	}
+	if !strings.Contains(warned, "host says no — p3") {
+		t.Fatalf("output = %q, want the resolve failure in the recap", warned)
+	}
+	if strings.Count(warned, deadline+" —") != 1 {
+		t.Fatalf("output = %q, want each reason exactly once in the recap", warned)
+	}
+}
+
 func TestPlainEmptyRun(t *testing.T) {
 	forceAscii(t)
 	var out strings.Builder
