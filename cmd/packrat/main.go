@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/EliasLd/packrat/internal/download"
 	"github.com/EliasLd/packrat/internal/engine"
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 	"github.com/EliasLd/packrat/internal/link"
@@ -91,7 +93,25 @@ func run(linkFile string, opt engine.Options, plain bool) {
 	var wait func()
 	opt.Observe = ui.Plain(ui.PlainOptions{Out: os.Stdout, Warn: os.Stderr})
 	if !plain && ui.IsTerminal(os.Stdout) {
-		opt.Observe, wait = ui.Interactive(ui.InteractiveOptions{Out: os.Stdout, Cancel: cancel})
+		// the pause key toggles the download gate and reports the state
+		// change as events, so both the gate and the view stay in sync
+		gate := download.NewGate()
+		opt.Gate = gate
+		var obs event.Observer
+		obs, wait = ui.Interactive(ui.InteractiveOptions{
+			Out:    os.Stdout,
+			Cancel: cancel,
+			Toggle: func() {
+				if gate.Paused() {
+					gate.Resume()
+					obs(event.Event{Kind: event.RunResumed})
+				} else {
+					gate.Pause()
+					obs(event.Event{Kind: event.RunPaused})
+				}
+			},
+		})
+		opt.Observe = obs
 	}
 
 	eng := engine.New(registry, opt)

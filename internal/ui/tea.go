@@ -29,6 +29,11 @@ type InteractiveOptions struct {
 	// Cancel performs a graceful stop (q or ctrl+c): cancels the run
 	// context so parts stop and keep their partial temp files.
 	Cancel func()
+
+	// Toggle flips the pause state (p); the caller wires it to the
+	// download gate and reports RunPaused/RunResumed events, which the
+	// model consumes like any other event.
+	Toggle func()
 }
 
 // Interactive renders the run through bubbletea in inline mode (no alternate
@@ -433,22 +438,23 @@ func (m *interactive) statsLine() string {
 		return ""
 	}
 
+	paused := ""
+	if m.paused {
+		paused = "  " + styleWarn.Render("[paused]")
+	}
+
 	if m.stats == nil {
 		if m.downloadsStarted == 0 {
-			return fmt.Sprintf("\n%s resolving %d/%d part(s)…\n",
-				styleAccent.Render("»"), m.resolved, m.partsTotal)
+			return fmt.Sprintf("\n%s resolving %d/%d part(s)…%s\n",
+				styleAccent.Render("»"), m.resolved, m.partsTotal, paused)
 		}
 		partsDone := m.done + m.skipped
 		pct := partsDone * 100 / m.partsTotal
-		line := fmt.Sprintf("\n%s %d/%d parts · %s @ %s/s · %s · %s\n",
+		return fmt.Sprintf("\n%s %d/%d parts · %s @ %s/s · %s · %s%s\n",
 			styleAccent.Render(fmt.Sprintf("%d%%", pct)),
 			partsDone, m.partsTotal,
 			event.HumanBytes(m.bytesTotal), event.HumanBytes(int64(m.aggSpeed)),
-			elapsed(m.now(), m.start), m.failuresLine())
-		if m.paused {
-			line += styleWarn.Render("[paused]") + "\n"
-		}
-		return line
+			elapsed(m.now(), m.start), m.failuresLine(), paused)
 	}
 
 	s := m.stats

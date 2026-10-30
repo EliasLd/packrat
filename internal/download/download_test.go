@@ -415,3 +415,151 @@ func TestDownloadHonorsCanceledContext(t *testing.T) {
 		t.Fatalf("partial temp must survive for resume, stat error: %v", err)
 	}
 }
+
+// slowServer serves the content in numChunks writes with a pause between
+// chunks, so tests can interleave with the stream.
+func slowServer(t *testing.T, id, content string, numChunks int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/"+id {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		for i := 0; i < numChunks; i++ {
+			from := i * len(content) / numChunks
+			to := (i + 1) * len(content) / numChunks
+			_, _ = w.Write([]byte(content[from:to]))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestGateBlocksStartupUntilResumed(t *testing.T) {
+	var requests int
+	server := serveFiles(t, &requests)
+	dir := t.TempDir()
+	gate := download.NewGate()
+	gate.Pause()
+	col := &collector{}
+
+	summaryCh := make(chan download.Summary, 1)
+	go func() {
+		summaryCh <- download.New(download.Options{OutDir: dir, Observe: col.observe, Gate: gate}).
+			Run(context.Background(), []download.Target{target(server.URL, "one")})
+	}()
+
+	select {
+	case summary := <-summaryCh:
+		t.Fatalf("run finished while paused: %+v", summary)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	gate.Resume()
+	summary := <-summaryCh
+	if len(summary.Failures) != 0 || summary.Done != 1 {
+		t.Fatalf("summary = %+v, want one completed download", summary)
+	}
+	if requests == 0 {
+		t.Fatal("no requests seen after resume")
+	}
+}
+
+func TestGatePausesAndResumesMidStream(t *testing.T) {
+	content := strings.Repeat("packrat-chunk-", 40) // 560 bytes
+	server := slowServer(t, "one", content, 10)
+	dir := t.TempDir()
+	gate := download.NewGate()
+	tgt := target(server.URL, "one")
+
+	summaryCh := make(chan download.Summary, 1)
+	go func() {
+		summaryCh <- download.New(download.Options{OutDir: dir, Gate: gate}).
+			Run(context.Background(), []download.Target{tgt})
+	}()
+
+	// pause once the stream has written something, then check nothing
+	// moves while paused
+	var pausedSize int64
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if fi, err := os.Stat(partPath(dir, tgt)); err == nil && fi.Size() > 0 {
+			gate.Pause()
+			pausedSize = fi.Size()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pausedSize == 0 {
+		t.Fatal("never observed partial progress before pausing")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if fi, err := os.Stat(partPath(dir, tgt)); err != nil || fi.Size() > pausedSize+int64(120) {
+		// a slow chunk may race the pause check; growth is only allowed
+		// for one in-flight chunk
+		t.Fatalf("download kept moving while paused: %d -> %d", pausedSize, sizeOf(partPath(dir, tgt)))
+	}
+
+	gate.Resume()
+	summary := <-summaryCh
+	if len(summary.Failures) != 0 {
+		t.Fatalf("unexpected failure after resume: %v", summary.Failures[0].Err)
+	}
+	got := readFile(t, finalPath(dir, tgt))
+	if string(got) != content {
+		t.Fatalf("resumed download content mismatch: %d bytes, want %d", len(got), len(content))
+	}
+}
+
+func sizeOf(path string) int64 {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+func TestGatePausesTheRetryBackoff(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		http.Error(w, "not available", http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	gate := download.NewGate()
+	col := &collector{}
+	tgt := target(server.URL, "one")
+
+	summaryCh := make(chan download.Summary, 1)
+	go func() {
+		summaryCh <- download.New(download.Options{
+			OutDir: dir, Retries: 2, Backoff: time.Hour, Observe: col.observe, Gate: gate,
+		}).Run(context.Background(), []download.Target{tgt})
+	}()
+
+	// wait for the first attempt to fail, then pause: the backoff sleep
+	// must not schedule the second attempt
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(col.of(event.DownloadRetry)) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(col.of(event.DownloadRetry)) == 0 {
+		t.Fatal("first attempt never failed")
+	}
+	gate.Pause()
+	time.Sleep(200 * time.Millisecond)
+	if requests != 1 {
+		t.Fatalf("requests = %d while the backoff is paused, want 1", requests)
+	}
+
+	gate.Resume()
+	summary := <-summaryCh
+	if len(summary.Failures) != 1 || requests != 2 {
+		t.Fatalf("summary = %+v requests = %d, want 1 failure across 2 attempts", summary, requests)
+	}
+}

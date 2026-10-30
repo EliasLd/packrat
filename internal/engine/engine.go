@@ -27,6 +27,7 @@ type Options struct {
 	Retries             int            // attempts per part (default 5)
 	UserAgent           string         // sent with download requests (empty = Go default)
 	Observe             event.Observer // progress events; nil emits nothing
+	Gate                *download.Gate // pause control for downloads; nil never pauses
 }
 
 // Engine coordinates the whole pipeline for one run.
@@ -99,6 +100,7 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 		UserAgent: e.opt.UserAgent,
 		Relink:    e.relink,
 		Observe:   e.observe,
+		Gate:      e.opt.Gate,
 	})
 	summary := downloader.Run(ctx, targets)
 
