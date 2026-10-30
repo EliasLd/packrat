@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/EliasLd/packrat/internal/event"
 )
 
 // ErrLinkExpired reports a 401/403/410 from the download server: the direct
@@ -31,7 +33,8 @@ var ErrLinkExpired = errors.New("direct link expired or refused")
 type Target struct {
 	URL      *url.URL // direct download URL
 	PageURL  *url.URL // landing page it was resolved from, for Relink
-	DirName  string
+	Part     string   // stable identity on the event stream (engine-owned)
+	DirName  string   // archive group the part belongs to
 	FileName string
 }
 
@@ -41,12 +44,14 @@ type Relinker func(ctx context.Context, t Target) (*url.URL, error)
 // Options configures a Downloader. Zero values fall back to the defaults
 // documented per field.
 type Options struct {
-	OutDir    string    // output root directory
-	Workers   int       // parallel downloads (default 8)
-	Retries   int       // attempts per target (default 5)
-	UserAgent string    // sent with download requests; empty sends Go's default
-	Relink    Relinker  // optional recovery hook for expired links
-	Output    io.Writer // event and progress lines (nil discards them)
+	OutDir    string         // output root directory
+	Workers   int            // parallel downloads (default 8)
+	Retries   int            // attempts per target (default 5)
+	Backoff   time.Duration  // base delay between attempts, scaled per attempt (default 2s)
+	UserAgent string         // sent with download requests; empty sends Go's default
+	Relink    Relinker       // optional recovery hook for expired links
+	Observe   event.Observer // progress events; nil emits nothing
+	Gate      *Gate          // pause control; nil never pauses
 }
 
 // Failure records one target that could not be downloaded.
@@ -68,31 +73,32 @@ type Downloader struct {
 	opt     Options
 	client  *http.Client
 	bytes   atomic.Int64
-	verbose bool
-	logMu   sync.Mutex
+	observe event.Observer
 }
 
 // New builds a Downloader with defaults applied for zero option values.
 func New(opt Options) *Downloader {
-	verbose := opt.Output != nil && opt.Output != io.Discard
 	if opt.Workers <= 0 {
 		opt.Workers = 8
 	}
 	if opt.Retries <= 0 {
 		opt.Retries = 5
 	}
-	if opt.Output == nil {
-		opt.Output = io.Discard
+	if opt.Backoff <= 0 {
+		opt.Backoff = 2 * time.Second
 	}
-	return &Downloader{opt: opt, client: &http.Client{}, verbose: verbose}
+	if opt.Observe == nil {
+		opt.Observe = event.Nop
+	}
+	return &Downloader{opt: opt, client: &http.Client{}, observe: opt.Observe}
 }
 
-// outf writes a line to the configured output, serialized so concurrent
-// workers cannot interleave partial writes.
-func (d *Downloader) outf(format string, args ...any) {
-	d.logMu.Lock()
-	defer d.logMu.Unlock()
-	_, _ = fmt.Fprintf(d.opt.Output, format, args...)
+// gateWait parks while the gate is paused, if a gate is wired at all.
+func (d *Downloader) gateWait(ctx context.Context) error {
+	if d.opt.Gate == nil {
+		return nil
+	}
+	return d.opt.Gate.Wait(ctx)
 }
 
 // Run downloads all targets with the configured worker pool. A canceled
@@ -106,20 +112,14 @@ func (d *Downloader) Run(ctx context.Context, targets []Target) Summary {
 		mu           sync.Mutex
 		doneCount    atomic.Int64
 		skippedCount atomic.Int64
-		speed        atomic.Int64 // smoothed bytes per second
 	)
 	record := func(t Target, err error) {
 		mu.Lock()
 		summary.Failures = append(summary.Failures, Failure{Target: t, Err: err})
 		mu.Unlock()
-		if d.verbose {
-			d.outf("  [FAIL] %-55s %v\n", t.FileName, err)
-		}
-	}
-
-	stop := make(chan struct{})
-	if d.verbose {
-		go d.printProgress(ctx, stop, summary.Total, &doneCount, &speed)
+		fail := eventFor(event.DownloadFail, t)
+		fail.Err = err
+		d.observe(fail)
 	}
 
 	sem := make(chan struct{}, d.opt.Workers)
@@ -127,6 +127,11 @@ func (d *Downloader) Run(ctx context.Context, targets []Target) Summary {
 		wg.Add(1)
 		go func(t Target) {
 			defer wg.Done()
+			// stop starting new work while paused or canceled
+			if err := d.gateWait(ctx); err != nil {
+				record(t, fmt.Errorf("interrupted: %w", err))
+				return
+			}
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -134,6 +139,11 @@ func (d *Downloader) Run(ctx context.Context, targets []Target) Summary {
 				return
 			}
 			defer func() { <-sem }()
+			// the gate may have flipped while waiting for a slot
+			if err := d.gateWait(ctx); err != nil {
+				record(t, fmt.Errorf("interrupted: %w", err))
+				return
+			}
 			skipped, err := d.one(ctx, t)
 			switch {
 			case err != nil:
@@ -146,33 +156,10 @@ func (d *Downloader) Run(ctx context.Context, targets []Target) Summary {
 		}(t)
 	}
 	wg.Wait()
-	close(stop)
 	summary.Done = int(doneCount.Load())
 	summary.Skipped = int(skippedCount.Load())
 	summary.Bytes = d.bytes.Load()
 	return summary
-}
-
-func (d *Downloader) printProgress(ctx context.Context, stop <-chan struct{}, total int, done *atomic.Int64, speed *atomic.Int64) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	prev := int64(0)
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cur := d.bytes.Load()
-			inst := float64(cur-prev) / 0.5 // bytes per second
-			prev = cur
-			old := speed.Load()
-			speed.Store(int64(float64(old)*0.7 + inst*0.3))
-			d.outf("\r[dl %d/%d parts] %s @ %6.1f MiB/s%8s",
-				done.Load(), total, humanBytes(cur), float64(speed.Load())/1024/1024, "")
-		}
-	}
 }
 
 // one downloads a single target with retries. skipped is true when the
@@ -184,23 +171,28 @@ func (d *Downloader) one(ctx context.Context, t Target) (bool, error) {
 		return false, err
 	}
 	if fi, err := os.Stat(target); err == nil && fi.Size() > 0 {
-		if d.verbose {
-			d.outf("  [skip] %-55s already downloaded (%s)\n", t.FileName, humanBytes(fi.Size()))
-		}
+		skip := eventFor(event.DownloadSkipped, t)
+		skip.Size = fi.Size()
+		d.observe(skip)
 		return true, nil
 	}
-	if resumeAt := fileSize(temp); resumeAt > 0 {
-		if d.verbose {
-			d.outf("  [resum] %-55s continuing at %s\n", t.FileName, humanBytes(resumeAt))
-		}
-	}
+	resumeAt := fileSize(temp)
+	start := eventFor(event.DownloadStart, t)
+	start.ResumeAt = resumeAt
+	d.observe(start)
+
+	pace := &progressPacer{observe: d.observe, group: t.DirName, part: t.Part}
 
 	var lastErr error
 	for attempt := 1; attempt <= d.opt.Retries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return false, fmt.Errorf("interrupted: %w", err)
 		}
-		written, total, err := d.stream(ctx, &t, temp)
+		// pausing between attempts keeps in-flight connections parked too
+		if err := d.gateWait(ctx); err != nil {
+			return false, fmt.Errorf("interrupted: %w", err)
+		}
+		written, total, err := d.stream(ctx, &t, temp, pace)
 		if err == nil && written >= total {
 			if err := os.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return false, err
@@ -208,6 +200,9 @@ func (d *Downloader) one(ctx context.Context, t Target) (bool, error) {
 			if err := os.Rename(temp, target); err != nil {
 				return false, err
 			}
+			done := eventFor(event.DownloadDone, t)
+			done.Size = total
+			d.observe(done)
 			return false, nil
 		}
 		if err != nil {
@@ -216,23 +211,78 @@ func (d *Downloader) one(ctx context.Context, t Target) (bool, error) {
 				if fresh, relinkErr := d.opt.Relink(ctx, t); relinkErr == nil {
 					t.URL = fresh
 				} else {
-					lastErr = fmt.Errorf("re-retrieve link: %w", relinkErr)
+					lastErr = fmt.Errorf("re-resolve link: %w", relinkErr)
 				}
 			}
 		} else {
-			lastErr = fmt.Errorf("short read (%s/%s)", humanBytes(written), humanBytes(total))
+			lastErr = fmt.Errorf("short read (%s/%s)", event.HumanBytes(written), event.HumanBytes(total))
 		}
-		if waitErr := sleepContext(ctx, time.Duration(attempt)*2*time.Second); waitErr != nil {
-			return false, fmt.Errorf("interrupted: %w", waitErr)
+		if attempt < d.opt.Retries {
+			retry := eventFor(event.DownloadRetry, t)
+			retry.Attempt, retry.Err = attempt, lastErr
+			d.observe(retry)
+			if waitErr := d.waitBackoff(ctx, attempt); waitErr != nil {
+				return false, fmt.Errorf("interrupted: %w", waitErr)
+			}
 		}
 	}
 	return false, fmt.Errorf("giving up after %d attempt(s): %w", d.opt.Retries, lastErr)
 }
 
+// waitBackoff sleeps attempt*Backoff with jitter, in short slices so a
+// pause parks the wait immediately. A pause engaged anywhere during the
+// backoff waives the rest of it: when the user resumes, the next attempt
+// should fire right away instead of re-queueing the full silence.
+func (d *Downloader) waitBackoff(ctx context.Context, attempt int) error {
+	target := time.Duration(attempt) * d.opt.Backoff
+	target += time.Duration(rand.Int63n(int64(d.opt.Backoff/4 + 1)))
+
+	epoch := d.pauseEpoch()
+	// A pause engaged before the backoff started counts too: whenever it
+	// lifts, the wait is over.
+	wasPaused := d.gatePaused()
+	var waited time.Duration
+	for waited < target {
+		if err := d.gateWait(ctx); err != nil {
+			return err
+		}
+		if wasPaused || d.pauseEpoch() != epoch {
+			return nil
+		}
+		start := time.Now()
+		if err := sleepSlice(ctx, min(target-waited, 250*time.Millisecond)); err != nil {
+			return err
+		}
+		waited += time.Since(start)
+	}
+	return nil
+}
+
+// pauseEpoch tracks pause activity for waitBackoff; a nil gate never moves.
+func (d *Downloader) pauseEpoch() uint64 {
+	if d.opt.Gate == nil {
+		return 0
+	}
+	return d.opt.Gate.Pauses()
+}
+
+func (d *Downloader) gatePaused() bool {
+	return d.opt.Gate != nil && d.opt.Gate.Paused()
+}
+
+func sleepSlice(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
 // stream performs one ranged HTTP fetch, appending to temp. It returns the
 // bytes now present in temp and the total size reported by the server.
 // A nil error means temp holds the complete file.
-func (d *Downloader) stream(ctx context.Context, t *Target, temp string) (written int64, total int64, err error) {
+func (d *Downloader) stream(ctx context.Context, t *Target, temp string, pace *progressPacer) (written int64, total int64, err error) {
 	writtenPrior := fileSize(temp)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.URL.String(), nil)
 	if err != nil {
@@ -300,6 +350,12 @@ func (d *Downloader) stream(ctx context.Context, t *Target, temp string) (writte
 				_ = resp.Body.Close()
 				return
 			case <-ticker.C:
+				// a paused stream is parked by design, not stalled;
+				// freshen so the watchdog never fires while paused
+				if d.opt.Gate != nil && d.opt.Gate.Paused() {
+					lastAct.Store(time.Now().Unix())
+					continue
+				}
 				if time.Since(time.Unix(lastAct.Load(), 0)) > 60*time.Second {
 					_ = resp.Body.Close()
 					return
@@ -311,6 +367,15 @@ func (d *Downloader) stream(ctx context.Context, t *Target, temp string) (writte
 	buf := make([]byte, 512<<10)
 	var n int64
 	for {
+		// pause gate: stop pulling bytes mid-stream; the connection is
+		// kept and the watchdog knows paused is not stalled
+		if d.opt.Gate != nil {
+			lastAct.Store(time.Now().Unix())
+			if err := d.opt.Gate.Wait(ctx); err != nil {
+				return writtenPrior + n, total, err
+			}
+			lastAct.Store(time.Now().Unix())
+		}
 		read, rerr := resp.Body.Read(buf)
 		if read > 0 {
 			if _, werr := f.Write(buf[:read]); werr != nil {
@@ -318,6 +383,7 @@ func (d *Downloader) stream(ctx context.Context, t *Target, temp string) (writte
 			}
 			n += int64(read)
 			d.bytes.Add(int64(read))
+			pace.send(writtenPrior+n, total, time.Now())
 			lastAct.Store(time.Now().Unix())
 		}
 		if rerr != nil {
@@ -330,6 +396,33 @@ func (d *Downloader) stream(ctx context.Context, t *Target, temp string) (writte
 			return writtenPrior + n, total, ctx.Err()
 		}
 	}
+}
+
+// eventFor seeds a download event with the identity fields of its target.
+func eventFor(kind event.Kind, t Target) event.Event {
+	return event.Event{Kind: kind, Group: t.DirName, Part: t.Part, Filename: t.FileName}
+}
+
+// progressPacer emits at most one Progress event per target: every 100 ms or
+// on a 1% size step, whichever comes first. Progress events are display
+// hints, so pacing exists only to keep the event stream cheap.
+type progressPacer struct {
+	observe  event.Observer
+	group    string
+	part     string
+	lastSent time.Time
+	lastDone int64
+}
+
+func (p *progressPacer) send(done, total int64, now time.Time) {
+	if p.observe == nil || total <= 0 {
+		return
+	}
+	if now.Sub(p.lastSent) < 100*time.Millisecond && done-p.lastDone < total/100 {
+		return
+	}
+	p.lastSent, p.lastDone = now, done
+	p.observe(event.Event{Kind: event.Progress, Group: p.group, Part: p.part, Done: done, Total: total})
 }
 
 func parseContentRangeTotal(contentRange string) (int64, bool) {
@@ -349,27 +442,4 @@ func fileSize(path string) int64 {
 		return fi.Size()
 	}
 	return 0
-}
-
-func humanBytes(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.2fGiB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.1fMiB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.1fKiB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%dB", n)
-	}
-}
-
-func sleepContext(ctx context.Context, d time.Duration) error {
-	jitter := time.Duration(rand.Int63n(int64(d/4 + 1)))
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d + jitter):
-		return nil
-	}
 }

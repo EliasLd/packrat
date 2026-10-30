@@ -1,17 +1,19 @@
 // Package engine wires parsed links through host resolution into concurrent
 // downloads: resolve every part via the host registry, then hand the direct
-// links to the download client.
+// links to the download client. Progress is reported as events through an
+// Observer; the engine never renders.
 package engine
 
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/EliasLd/packrat/internal/download"
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/link"
 )
@@ -19,24 +21,24 @@ import (
 // Options configures an Engine. Zero values fall back to the defaults
 // documented per field.
 type Options struct {
-	OutDir              string // output root directory (default "downloads")
-	ResolveConcurrency  int    // parallel landing-page resolutions (default 3)
-	DownloadConcurrency int    // parallel downloads (default 8)
-	Retries             int    // attempts per part (default 5)
-	UserAgent           string // sent with download requests (empty = Go default)
+	OutDir              string         // output root directory (default "downloads")
+	ResolveConcurrency  int            // parallel landing-page resolutions (default 3)
+	DownloadConcurrency int            // parallel downloads (default 8)
+	Retries             int            // attempts per part (default 5)
+	UserAgent           string         // sent with download requests (empty = Go default)
+	Observe             event.Observer // progress events; nil emits nothing
+	Gate                *download.Gate // pause control for downloads; nil never pauses
 }
 
 // Engine coordinates the whole pipeline for one run.
 type Engine struct {
 	registry *host.Registry
 	opt      Options
-	out      io.Writer // event and progress output
-	warn     io.Writer // failures and warning output
-	logMu    sync.Mutex
+	observe  event.Observer
 }
 
-// New builds an Engine; nil writers are replaced with quiet sinks.
-func New(registry *host.Registry, opt Options, out, warn io.Writer) *Engine {
+// New builds an Engine; a nil Observer emits nothing.
+func New(registry *host.Registry, opt Options) *Engine {
 	if opt.OutDir == "" {
 		opt.OutDir = "downloads"
 	}
@@ -49,50 +51,96 @@ func New(registry *host.Registry, opt Options, out, warn io.Writer) *Engine {
 	if opt.Retries <= 0 {
 		opt.Retries = 5
 	}
-	if out == nil {
-		out = io.Discard
+	if opt.Observe == nil {
+		opt.Observe = event.Nop
 	}
-	if warn == nil {
-		warn = io.Discard
-	}
-	return &Engine{registry: registry, opt: opt, out: out, warn: warn}
-}
-
-func (e *Engine) outf(format string, args ...any) {
-	e.logMu.Lock()
-	defer e.logMu.Unlock()
-	_, _ = fmt.Fprintf(e.out, format, args...)
-}
-
-func (e *Engine) warnf(format string, args ...any) {
-	e.logMu.Lock()
-	defer e.logMu.Unlock()
-	_, _ = fmt.Fprintf(e.warn, format, args...)
+	return &Engine{registry: registry, opt: opt, observe: opt.Observe}
 }
 
 // Run resolves every part and downloads it. It returns a non-nil error when
-// at least one part failed; individual failures were already reported.
+// at least one part failed; individual failures were already reported as
+// events.
 func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
+	start := time.Now()
+
 	var parts []*link.Part
 	for _, g := range groups {
 		parts = append(parts, g.Parts...)
 	}
 	if len(parts) == 0 {
-		e.outf("no links to process\n")
+		e.observe(event.Event{Kind: event.RunDone, Stats: &event.Stats{}})
 		return nil
 	}
-	e.outf("resolving %d part(s) across %d archive group(s)...\n", len(parts), len(groups))
 
+	plan := make([]event.PlanEntry, 0, len(parts))
+	for _, p := range parts {
+		plan = append(plan, event.PlanEntry{Group: p.DirName, Part: p.ID})
+	}
+	e.observe(event.Event{Kind: event.RunStart,
+		Stats: &event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups)},
+		Plan:  plan})
+
+	targets, resolveFails := e.resolveAll(ctx, parts)
+
+	if ctx.Err() != nil {
+		e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups),
+			Failed: int(resolveFails.Load())}, start)})
+		return fmt.Errorf("%w: %s", context.Canceled, "resolve phase interrupted")
+	}
+	if len(targets) == 0 {
+		e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups),
+			Failed: int(resolveFails.Load())}, start)})
+		return fmt.Errorf("%d part(s) failed to resolve, nothing to download", resolveFails.Load())
+	}
+
+	downloader := download.New(download.Options{
+		OutDir:    e.opt.OutDir,
+		Workers:   e.opt.DownloadConcurrency,
+		Retries:   e.opt.Retries,
+		UserAgent: e.opt.UserAgent,
+		Relink:    e.relink,
+		Observe:   e.observe,
+		Gate:      e.opt.Gate,
+	})
+	summary := downloader.Run(ctx, targets)
+
+	stats := event.Stats{
+		PartsTotal:  len(parts),
+		GroupsTotal: len(groups),
+		Done:        summary.Done,
+		Skipped:     summary.Skipped,
+		Failed:      len(summary.Failures) + int(resolveFails.Load()),
+		Bytes:       summary.Bytes,
+	}
+	e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(stats, start)})
+
+	if stats.Failed > 0 {
+		return fmt.Errorf("%d part(s) failed", stats.Failed)
+	}
+	return nil
+}
+
+// finalStats fills the timing fields shared by every RunDone event.
+func finalStats(s event.Stats, start time.Time) *event.Stats {
+	s.Elapsed = time.Since(start)
+	return &s
+}
+
+// resolveAll turns every part into a download target, running the host
+// registry with bounded concurrency. Parts that fail are counted and
+// reported as ResolveFail events; the rest still download.
+func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download.Target, *atomic.Int64) {
 	var (
-		wg           sync.WaitGroup
-		mu           sync.Mutex
-		targets      []download.Target
-		resolveFails atomic.Int64
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		targets []download.Target
+		fails   atomic.Int64
 	)
+
 	sem := make(chan struct{}, e.opt.ResolveConcurrency)
-	for i, p := range parts {
+	for _, p := range parts {
 		wg.Add(1)
-		go func(i int, p *link.Part) {
+		go func(p *link.Part) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -105,64 +153,40 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 			}
 			pageURL, err := url.Parse(p.PageURL)
 			if err != nil {
-				resolveFails.Add(1)
-				e.warnf("  [resolve FAIL] %s: %v\n", p.ID, err)
+				fails.Add(1)
+				e.observe(event.Event{Kind: event.ResolveFail, Part: p.ID, Err: err})
 				return
 			}
-			resolvedHost, err := e.registry.Lookup(pageURL)
+			direct, err := e.resolve(ctx, pageURL)
 			if err != nil {
-				resolveFails.Add(1)
-				e.warnf("  [resolve FAIL] %s: %v\n", p.ID, err)
+				fails.Add(1)
+				e.observe(event.Event{Kind: event.ResolveFail, Part: p.ID, Err: err})
 				return
 			}
-			direct, err := resolvedHost.Resolve(ctx, pageURL)
-			if err != nil {
-				resolveFails.Add(1)
-				e.warnf("  [resolve FAIL] %s: %v\n", p.ID, err)
-				return
-			}
+			name := e.finalName(p, direct.Filename)
 			mu.Lock()
 			targets = append(targets, download.Target{
 				URL:      direct.URL,
 				PageURL:  pageURL,
+				Part:     p.ID,
 				DirName:  p.DirName,
-				FileName: e.finalName(p, direct.Filename),
+				FileName: name,
 			})
 			mu.Unlock()
-			e.outf("  [%2d/%2d] %s OK\n", i+1, len(parts), e.finalName(p, direct.Filename))
-		}(i, p)
+			e.observe(event.Event{Kind: event.ResolveDone, Group: p.DirName, Part: p.ID, Filename: name})
+		}(p)
 	}
 	wg.Wait()
+	return targets, &fails
+}
 
-	if ctx.Err() != nil {
-		return fmt.Errorf("%w: %s", context.Canceled, "resolve phase interrupted")
+// resolve funnels one parsed landing page through the host registry.
+func (e *Engine) resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
+	resolvedHost, err := e.registry.Lookup(pageURL)
+	if err != nil {
+		return host.DirectLink{}, err
 	}
-	if int64(len(targets)) == 0 {
-		return fmt.Errorf("%d part(s) failed to resolve, nothing to download", resolveFails.Load())
-	}
-	if f := resolveFails.Load(); f > 0 {
-		e.warnf("%d part(s) failed to resolve\n", f)
-	}
-
-	downloader := download.New(download.Options{
-		OutDir:    e.opt.OutDir,
-		Workers:   e.opt.DownloadConcurrency,
-		Retries:   e.opt.Retries,
-		UserAgent: e.opt.UserAgent,
-		Relink:    e.relink,
-		Output:    e.out,
-	})
-	summary := downloader.Run(ctx, targets)
-	for _, f := range summary.Failures {
-		e.warnf("  [FAIL] %s: %v\n", f.Target.FileName, f.Err)
-	}
-	e.outf("done: %d/%d part(s) downloaded, %d skipped, %d resolve failure(s)\n",
-		summary.Done, len(targets), summary.Skipped, resolveFails.Load())
-
-	if failed := len(summary.Failures) + int(resolveFails.Load()); failed > 0 {
-		return fmt.Errorf("%d part(s) failed", failed)
-	}
-	return nil
+	return resolvedHost.Resolve(ctx, pageURL)
 }
 
 // finalName picks the file name for a part: the archive fragment when the
