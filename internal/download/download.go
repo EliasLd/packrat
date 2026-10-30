@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,27 @@ import (
 // URL most likely has a limited lifetime or single use. Wire a Relinker to
 // have such targets re-resolved automatically.
 var ErrLinkExpired = errors.New("direct link expired or refused")
+
+// ErrRateLimited reports a 429 from the download server. Unlike link
+// expiry, the target is fine: the server is pacing us, so the pause the
+// Retry-After asks for is owed before the next attempt.
+var ErrRateLimited = errors.New("download server rate limited")
+
+// RateLimitedError carries a 429 answer's retry delay (zero when the
+// server sent no usable Retry-After).
+type RateLimitedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitedError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%s: retry after %s", ErrRateLimited, e.RetryAfter)
+	}
+	return ErrRateLimited.Error()
+}
+
+// Unwrap ties the type to the sentinel so errors.Is(ErrRateLimited) holds.
+func (e *RateLimitedError) Unwrap() error { return ErrRateLimited }
 
 // Target is one file to download into <OutDir>/<DirName>/<FileName>.
 type Target struct {
@@ -221,7 +243,7 @@ func (d *Downloader) one(ctx context.Context, t Target) (bool, error) {
 			retry := eventFor(event.DownloadRetry, t)
 			retry.Attempt, retry.Err = attempt, lastErr
 			d.observe(retry)
-			if waitErr := d.waitBackoff(ctx, attempt); waitErr != nil {
+			if waitErr := d.waitRetryBackoff(ctx, attempt, lastErr); waitErr != nil {
 				return false, fmt.Errorf("interrupted: %w", waitErr)
 			}
 		}
@@ -229,16 +251,13 @@ func (d *Downloader) one(ctx context.Context, t Target) (bool, error) {
 	return false, fmt.Errorf("giving up after %d attempt(s): %w", d.opt.Retries, lastErr)
 }
 
-// waitBackoff sleeps attempt*Backoff with jitter, in short slices so a
-// pause parks the wait immediately. A pause engaged anywhere during the
-// backoff waives the rest of it: when the user resumes, the next attempt
-// should fire right away instead of re-queueing the full silence.
-func (d *Downloader) waitBackoff(ctx context.Context, attempt int) error {
-	target := time.Duration(attempt) * d.opt.Backoff
-	target += time.Duration(rand.Int63n(int64(d.opt.Backoff/4 + 1)))
-
+// waitDelay sleeps for target in short slices so a pause parks the wait
+// immediately. A pause engaged anywhere during the wait waives the rest of
+// it: when the user resumes, the next attempt should fire right away
+// instead of re-queueing the full silence.
+func (d *Downloader) waitDelay(ctx context.Context, target time.Duration) error {
 	epoch := d.pauseEpoch()
-	// A pause engaged before the backoff started counts too: whenever it
+	// A pause engaged before the wait started counts too: whenever it
 	// lifts, the wait is over.
 	wasPaused := d.gatePaused()
 	var waited time.Duration
@@ -250,7 +269,7 @@ func (d *Downloader) waitBackoff(ctx context.Context, attempt int) error {
 			return nil
 		}
 		start := time.Now()
-		if err := sleepSlice(ctx, min(target-waited, 250*time.Millisecond)); err != nil {
+		if err := sleepSlice(ctx, min(target-waited, sliceStep)); err != nil {
 			return err
 		}
 		waited += time.Since(start)
@@ -258,7 +277,47 @@ func (d *Downloader) waitBackoff(ctx context.Context, attempt int) error {
 	return nil
 }
 
-// pauseEpoch tracks pause activity for waitBackoff; a nil gate never moves.
+// sliceStep is the pause-check granularity of the retry waits.
+const sliceStep = 250 * time.Millisecond
+
+// retryCap is the longest single pause a 429 answer may impose on one
+// attempt; longer ones abandon the attempt budget instead of camping.
+const retryCap = 2 * time.Minute
+
+// waitRetryBackoff picks the wait after a failed attempt: a rate limit
+// answer overrides the regular ladder with the server-mandated pause
+// (jitter stays upward-only, so the floor the host set is never shortened
+// and the rhythm stays irregular).
+func (d *Downloader) waitRetryBackoff(ctx context.Context, attempt int, lastErr error) error {
+	target := time.Duration(attempt) * d.opt.Backoff
+	var limited *RateLimitedError
+	if errors.As(lastErr, &limited) {
+		target = max(clampRetryWait(limited.RetryAfter), target)
+	}
+	return d.waitDelay(ctx, jitterUp(target))
+}
+
+// clampRetryWait folds a server-mandated pause into sane bounds.
+func clampRetryWait(d time.Duration) time.Duration {
+	return min(max(d, 2*time.Second), retryCap)
+}
+
+// jitterUp widens a wait by up to 25 percent, upward only.
+func jitterUp(d time.Duration) time.Duration {
+	return d + time.Duration(rand.Int63n(int64(d/4+1)))
+}
+
+// parseRetryAfterHeader reads a Retry-After header; only the seconds form
+// is supported, HTTP-date answers count as unknown.
+func parseRetryAfterHeader(raw string) (time.Duration, bool) {
+	secs, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || secs <= 0 {
+		return 0, false
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
+// pauseEpoch tracks pause activity for the retry waits; a nil gate never moves.
 func (d *Downloader) pauseEpoch() uint64 {
 	if d.opt.Gate == nil {
 		return 0
@@ -315,6 +374,12 @@ func (d *Downloader) stream(ctx context.Context, t *Target, temp string, pace *p
 		if !ok {
 			return 0, 0, errors.New("206 response with unparseable Content-Range")
 		}
+	case http.StatusTooManyRequests:
+		// the URL is valid, the host is merely pacing us: never treat
+		// this as link expiry (a relink would help nobody); the retry
+		// loop owes the server its pause instead
+		ra, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"))
+		return 0, 0, &RateLimitedError{RetryAfter: ra}
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusGone:
 		return 0, 0, fmt.Errorf("%w (status %d)", ErrLinkExpired, resp.StatusCode)
 	default:

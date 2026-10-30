@@ -6,6 +6,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sync"
@@ -17,6 +18,12 @@ import (
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/link"
 )
+
+// resolveStreakAbort is how many consecutive rate-limited resolutions end
+// the resolve phase in one run: a number too high to trip on a per-token
+// hiccup, high enough to mean the whole IP is being limited. The remaining
+// parts are failed fast instead of queueing politely into a closed door.
+const resolveStreakAbort = 3
 
 // Options configures an Engine. Zero values fall back to the defaults
 // documented per field.
@@ -80,7 +87,7 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 		Stats: &event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups)},
 		Plan:  plan})
 
-	targets, resolveFails := e.resolveAll(ctx, parts)
+	targets, resolveFails, limited := e.resolveAll(ctx, parts)
 
 	if ctx.Err() != nil {
 		e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups),
@@ -88,6 +95,11 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 		return fmt.Errorf("%w: %s", context.Canceled, "resolve phase interrupted")
 	}
 	if len(targets) == 0 {
+		if limited {
+			e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups),
+				Failed: int(resolveFails.Load())}, start)})
+			return fmt.Errorf("host is rate limiting — %d part(s) failed to resolve; rerun the same command later", resolveFails.Load())
+		}
 		e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(event.Stats{PartsTotal: len(parts), GroupsTotal: len(groups),
 			Failed: int(resolveFails.Load())}, start)})
 		return fmt.Errorf("%d part(s) failed to resolve, nothing to download", resolveFails.Load())
@@ -115,6 +127,9 @@ func (e *Engine) Run(ctx context.Context, groups []link.Group) error {
 	e.observe(event.Event{Kind: event.RunDone, Stats: finalStats(stats, start)})
 
 	if stats.Failed > 0 {
+		if limited {
+			return fmt.Errorf("host is rate limiting — %d part(s) failed; rerun the same command later", stats.Failed)
+		}
 		return fmt.Errorf("%d part(s) failed", stats.Failed)
 	}
 	return nil
@@ -129,12 +144,19 @@ func finalStats(s event.Stats, start time.Time) *event.Stats {
 // resolveAll turns every part into a download target, running the host
 // registry with bounded concurrency. Parts that fail are counted and
 // reported as ResolveFail events; the rest still download.
-func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download.Target, *atomic.Int64) {
+//
+// When the host rate limits three parts in a row (no success between), the
+// phase bails out: parts still waiting for a slot are failed fast with the
+// same typed reason — with the whole IP limited, queueing them into the
+// host changes nothing but delay.
+func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download.Target, *atomic.Int64, bool) {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
 		targets []download.Target
 		fails   atomic.Int64
+		streak  atomic.Int64
+		limited atomic.Bool
 	)
 
 	sem := make(chan struct{}, e.opt.ResolveConcurrency)
@@ -151,6 +173,14 @@ func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download
 			if ctx.Err() != nil {
 				return
 			}
+
+			if limited.Load() {
+				fails.Add(1)
+				e.observe(event.Event{Kind: event.ResolveFail, Part: p.ID,
+					Err: fmt.Errorf("%w: part skipped while the host rate limits", host.ErrRateLimited)})
+				return
+			}
+
 			pageURL, err := url.Parse(p.PageURL)
 			if err != nil {
 				fails.Add(1)
@@ -159,10 +189,18 @@ func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download
 			}
 			direct, err := e.resolve(ctx, pageURL)
 			if err != nil {
+				if errors.Is(err, host.ErrRateLimited) {
+					if streak.Add(1) >= resolveStreakAbort {
+						limited.Store(true)
+					}
+				} else {
+					streak.Store(0)
+				}
 				fails.Add(1)
 				e.observe(event.Event{Kind: event.ResolveFail, Part: p.ID, Err: err})
 				return
 			}
+			streak.Store(0)
 			name := e.finalName(p, direct.Filename)
 			mu.Lock()
 			targets = append(targets, download.Target{
@@ -177,7 +215,7 @@ func (e *Engine) resolveAll(ctx context.Context, parts []*link.Part) ([]download
 		}(p)
 	}
 	wg.Wait()
-	return targets, &fails
+	return targets, &fails, limited.Load()
 }
 
 // resolve funnels one parsed landing page through the host registry.

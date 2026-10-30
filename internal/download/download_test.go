@@ -599,3 +599,59 @@ func TestGatePausesTheRetryBackoff(t *testing.T) {
 		t.Fatalf("summary = %+v requests = %d, want 1 failure across 2 attempts", summary, requests)
 	}
 }
+
+// rateLimitHandler answers 429 with a Retry-After for the first requestCount
+// requests, then serves the file normally.
+func rateLimitHandler(t *testing.T, id string, requestCount *int, limit int) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*requestCount++
+		if *requestCount <= limit {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		http.ServeContent(w, r, id, time.Time{}, strings.NewReader(string(archive[id])))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestDownloadHonorsRetryAfterOn429(t *testing.T) {
+	var requests int
+	server := rateLimitHandler(t, "one", &requests, 1)
+	dir := t.TempDir()
+	tgt := target(server.URL, "one")
+	relinked := false
+	col := &collector{}
+
+	summary := download.New(download.Options{
+		OutDir:  dir,
+		Retries: 3,
+		Backoff: time.Millisecond, // isolate the Retry-After wait
+		Relink: func(ctx context.Context, t download.Target) (*url.URL, error) {
+			relinked = true
+			return nil, errors.New("relink must not run on a rate limit")
+		},
+		Observe: col.observe,
+	}).Run(context.Background(), []download.Target{tgt})
+
+	if len(summary.Failures) != 0 {
+		t.Fatalf("summary = %+v, want the target recovered after the pause", summary)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want the 429 answered by exactly one retry", requests)
+	}
+	if relinked {
+		t.Fatal("a 429 must never trigger a relink")
+	}
+	if got, want := readFile(t, finalPath(dir, tgt)), archive["one"]; string(got) != string(want) {
+		t.Fatalf("file = %q, want %q", got, want)
+	}
+	// the pause was the server-mandated 2s, not the 1ms retry backoff
+	retries := col.of(event.DownloadRetry)
+	if len(retries) != 1 || retries[0].Err == nil || retries[0].Err.Error() != "download server rate limited: retry after 2s" {
+		t.Fatalf("retry events = %+v, want the typed rate limit with the delay", retries)
+	}
+}

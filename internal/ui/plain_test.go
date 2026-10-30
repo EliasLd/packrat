@@ -82,6 +82,30 @@ func TestPlainThrottlesAggregate(t *testing.T) {
 	}
 }
 
+func TestPlainReportsCooldowns(t *testing.T) {
+	forceAscii(t)
+	var out, warn strings.Builder
+	obs := Plain(PlainOptions{Out: &out, Warn: &warn, ProgressInterval: -time.Second})
+
+	obs(event.Event{Kind: event.RunStart, Stats: &event.Stats{PartsTotal: 2, GroupsTotal: 1}})
+	obs(event.Event{
+		Kind: event.Cooling,
+		Wait: 30 * time.Second,
+		Err:  errors.New("host rate limit (status 429): retry after 30s"),
+	})
+
+	warned := warn.String()
+	if !strings.Contains(warned, "cooling 30s") {
+		t.Fatalf("warn = %q, want the cooling line", warned)
+	}
+	if !strings.Contains(warned, "host rate limit (status 429)") {
+		t.Fatalf("warn = %q, want the reason next to the pause", warned)
+	}
+	if out.String() != "resolving 2 part(s) across 1 archive group(s)...\n" {
+		t.Fatalf("out = %q, want the run start only", out.String())
+	}
+}
+
 func TestPlainRecapsFailedPartsGroupedByReason(t *testing.T) {
 	forceAscii(t)
 	var out, warn strings.Builder

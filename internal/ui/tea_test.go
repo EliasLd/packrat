@@ -337,6 +337,28 @@ func TestInteractiveSpeedReadoutMovesOncePerSecond(t *testing.T) {
 	}
 }
 
+func TestInteractiveShowsAndExpiresCooldowns(t *testing.T) {
+	base := time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
+	m := newInteractiveModel(InteractiveOptions{})
+	m.now = func() time.Time { return base }
+
+	m2, _ := apply(t, m, event.Event{
+		Kind: event.Cooling,
+		Wait: 30 * time.Second,
+		Err:  errors.New("host rate limit (status 429)"),
+	})
+	view := m2.View()
+	if !strings.Contains(view, "cooling 30s") || !strings.Contains(view, "host rate limit (status 429)") {
+		t.Fatalf("view = %q, want the cooling line with its reason", view)
+	}
+
+	// once the imposed wait is over, the line leaves the frame
+	m2.now = func() time.Time { return base.Add(31 * time.Second) }
+	if strings.Contains(m2.View(), "cooling 30s") {
+		t.Fatal("the cooling line must expire when the wait is over")
+	}
+}
+
 func TestInteractiveStableRowOrder(t *testing.T) {
 	m, _ := apply(t, newInteractiveModel(InteractiveOptions{}), event.Event{
 		Kind:  event.RunStart,

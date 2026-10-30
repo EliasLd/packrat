@@ -106,6 +106,10 @@ func (p *plain) observe(e event.Event) {
 		p.failures = append(p.failures, failedPart{name: name(e), reason: errText(e.Err)})
 		p.endLine()
 		_, _ = fmt.Fprintf(p.opt.Warn, "  %s %s: %v\n", styleFail.Render("[FAIL]"), name(e), e.Err)
+	case event.Cooling:
+		p.endLine()
+		_, _ = fmt.Fprintf(p.opt.Warn, "  %s cooling %v: %s\n",
+			styleWarn.Render("[rate limit]"), e.Wait, errText(e.Err))
 	case event.RunPaused:
 		p.endLine()
 		_, _ = fmt.Fprintf(p.opt.Out, "  %s paused\n", styleWarn.Render("[pause]"))

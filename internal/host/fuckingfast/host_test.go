@@ -7,11 +7,14 @@ import (
 	"io"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	bhttp "github.com/bogdanfinn/fhttp"
 
+	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 )
@@ -21,6 +24,9 @@ var pageValid string
 
 //go:embed testdata/page_broken.html
 var pageBroken string
+
+//go:embed testdata/page_rate_limit.html
+var pageRateLimit string
 
 const (
 	pageURLText  = "https://fuckingfast.co/abc123"
@@ -32,11 +38,11 @@ const (
 // fakeClient responds to requests via a configurable handler and counts calls.
 type fakeClient struct {
 	do    func(req *bhttp.Request) (*bhttp.Response, error)
-	calls int
+	calls atomic.Int64 // safe for concurrent Do, as the resolver fans out
 }
 
 func (f *fakeClient) Do(req *bhttp.Request) (*bhttp.Response, error) {
-	f.calls++
+	f.calls.Add(1)
 	return f.do(req)
 }
 
@@ -71,6 +77,8 @@ func resolvedHost(t *testing.T, client *fakeClient) host.Host {
 	h, err := fuckingfast.New(
 		fuckingfast.WithHTTPClient(client),
 		fuckingfast.WithBaseDelay(time.Millisecond),
+		// pacing disabled: this helper must keep the existing tests instant
+		fuckingfast.WithMinRequestInterval(0),
 	)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -86,7 +94,7 @@ func TestResolve(t *testing.T) {
 
 	t.Run("happy path returns the direct link with the page title as filename", func(t *testing.T) {
 		client := happyHandler(t)
-		h := resolvedHost(t, client)
+		h := snappyHost(t, client, &recordingSleep{})
 
 		got, err := h.Resolve(context.Background(), pageURL)
 		if err != nil {
@@ -110,7 +118,7 @@ func TestResolve(t *testing.T) {
 			}
 			return makeResponse(500, nil, "boom"), nil
 		}}
-		h := resolvedHost(t, handler)
+		h := snappyHost(t, handler, &recordingSleep{})
 
 		_, err := h.Resolve(context.Background(), pageURL)
 		if err == nil {
@@ -119,8 +127,8 @@ func TestResolve(t *testing.T) {
 		if !strings.Contains(err.Error(), "resolve after 3 attempt(s)") {
 			t.Fatalf("Resolve() error = %v, want attempts exhausted", err)
 		}
-		if handler.calls != 6 { // 3 page fetches + 3 download posts
-			t.Fatalf("calls = %d, want 6", handler.calls)
+		if handler.calls.Load() != 6 { // 3 page fetches + 3 download posts
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
 		}
 	})
 
@@ -128,14 +136,14 @@ func TestResolve(t *testing.T) {
 		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
 			return makeResponse(200, nil, pageBroken), nil
 		}}
-		h := resolvedHost(t, handler)
+		h := snappyHost(t, handler, &recordingSleep{})
 
 		_, err := h.Resolve(context.Background(), pageURL)
 		if !errors.Is(err, fuckingfast.ErrLayoutChanged) {
 			t.Fatalf("Resolve() error = %v, want ErrLayoutChanged", err)
 		}
-		if handler.calls != 1 {
-			t.Fatalf("calls = %d, want 1 (no retry on permanent error)", handler.calls)
+		if handler.calls.Load() != 1 {
+			t.Fatalf("calls = %d, want 1 (no retry on permanent error)", handler.calls.Load())
 		}
 	})
 
@@ -146,20 +154,20 @@ func TestResolve(t *testing.T) {
 			}
 			return makeResponse(200, nil, "flash message: try again"), nil
 		}}
-		h := resolvedHost(t, handler)
+		h := snappyHost(t, handler, &recordingSleep{})
 
 		_, err := h.Resolve(context.Background(), pageURL)
 		if !errors.Is(err, fuckingfast.ErrNoDirectLink) {
 			t.Fatalf("Resolve() error = %v, want ErrNoDirectLink", err)
 		}
-		if handler.calls != 6 {
-			t.Fatalf("calls = %d, want 6", handler.calls)
+		if handler.calls.Load() != 6 {
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
 		}
 	})
 
 	t.Run("canceled context stops before any request", func(t *testing.T) {
 		handler := &fakeClient{}
-		h := resolvedHost(t, handler)
+		h := snappyHost(t, handler, &recordingSleep{})
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -167,10 +175,185 @@ func TestResolve(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Resolve() error = %v, want context.Canceled", err)
 		}
-		if handler.calls != 0 {
-			t.Fatalf("calls = %d, want 0", handler.calls)
+		if handler.calls.Load() != 0 {
+			t.Fatalf("calls = %d, want 0", handler.calls.Load())
 		}
 	})
+}
+
+// snappyHost builds a resolver with pacing and real waiting disabled; all
+// sleeps (limiter slots and retry waits) surface through the recorder.
+func snappyHost(t *testing.T, client *fakeClient, s *recordingSleep) *fuckingfast.Host {
+	t.Helper()
+	h, err := fuckingfast.New(
+		fuckingfast.WithHTTPClient(client),
+		fuckingfast.WithBaseDelay(time.Millisecond),
+		fuckingfast.WithMinRequestInterval(0),
+		fuckingfast.WithSleep(s.sleep),
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	return h
+}
+
+func TestRateLimitResponses(t *testing.T) {
+	pageURL, err := url.Parse(pageURLText)
+	if err != nil {
+		t.Fatalf("test url: %v", err)
+	}
+
+	t.Run("a 200 page with limit text is a rate limit, not a layout change", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(200, nil, pageRateLimit), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if errors.Is(err, fuckingfast.ErrLayoutChanged) {
+			t.Fatal("a rate limit page must never be reported as a layout change")
+		}
+		if !strings.Contains(err.Error(), "page suggests rate limiting") {
+			t.Fatalf("Resolve() error = %v, want the limiting detail", err)
+		}
+	})
+
+	t.Run("status 429 carries the parsed Retry-After", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		var limited *host.RateLimitedError
+		if !errors.As(err, &limited) {
+			t.Fatalf("Resolve() error = %v, want a *host.RateLimitedError", err)
+		}
+		if limited.RetryAfter != 30*time.Second {
+			t.Fatalf("RetryAfter = %v, want 30s", limited.RetryAfter)
+		}
+		if !strings.Contains(err.Error(), "retry after 30s") {
+			t.Fatalf("Resolve() error = %v, want the retry hint in the text", err)
+		}
+	})
+
+	t.Run("status 503 on the download endpoint is limiting too", func(t *testing.T) {
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			if req.Method == bhttp.MethodGet {
+				return makeResponse(200, nil, pageValid), nil
+			}
+			return makeResponse(503, nil, ""), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if handler.calls.Load() != 6 {
+			t.Fatalf("calls = %d, want 6", handler.calls.Load())
+		}
+	})
+
+	t.Run("a 200 download answer with limit text is limiting", func(t *testing.T) {
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			if req.Method == bhttp.MethodGet {
+				return makeResponse(200, nil, pageValid), nil
+			}
+			return makeResponse(200, nil, "you hit the rate limit, calm down"), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if errors.Is(err, fuckingfast.ErrNoDirectLink) {
+			t.Fatal("a limit message must not be confused with a missing direct link")
+		}
+	})
+
+	t.Run("an unrecognized failure keeps the old plain error", func(t *testing.T) {
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(404, nil, "not found"), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if err == nil || !strings.Contains(err.Error(), "download page status 404") {
+			t.Fatalf("Resolve() error = %v, want the plain status error", err)
+		}
+		if errors.Is(err, host.ErrRateLimited) {
+			t.Fatal("404 must not count as a rate limit")
+		}
+	})
+}
+
+// eventLog records events emitted by the resolver itself.
+type eventLog struct {
+	mu     sync.Mutex
+	events []event.Event
+}
+
+func (l *eventLog) observe(e event.Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.events = append(l.events, e)
+}
+
+func (l *eventLog) of(kind event.Kind) []event.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []event.Event
+	for _, e := range l.events {
+		if e.Kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestResolverReportsCooldowns(t *testing.T) {
+	pageURL, err := url.Parse(pageURLText)
+	if err != nil {
+		t.Fatalf("test url: %v", err)
+	}
+
+	var waits []time.Duration
+	log := &eventLog{}
+	h, err := fuckingfast.New(
+		fuckingfast.WithHTTPClient(&fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+		}}),
+		fuckingfast.WithBaseDelay(time.Millisecond),
+		fuckingfast.WithMinRequestInterval(0),
+		fuckingfast.WithSleep(func(ctx context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		}),
+		fuckingfast.WithObserve(log.observe),
+	)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	_, resolveErr := h.Resolve(context.Background(), pageURL)
+	if !errors.Is(resolveErr, host.ErrRateLimited) {
+		t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", resolveErr)
+	}
+	cooldowns := log.of(event.Cooling)
+	if len(cooldowns) != 2 { // one before each of the two retried waits
+		t.Fatalf("cooldown events = %d, want one per imposed pause (%v)", len(cooldowns), waits)
+	}
+	if cooldowns[0].Wait != 30*time.Second {
+		t.Fatalf("cooldown waits = %v, want the host-mandated 30s", cooldowns[0].Wait)
+	}
+	if cooldowns[0].Err == nil || cooldowns[0].Err.Error() != "host rate limit (status 429): retry after 30s" {
+		t.Fatalf("cooldown reason = %v, want the typed rate limit", cooldowns[0].Err)
+	}
 }
 
 func TestMatches(t *testing.T) {
@@ -209,4 +392,112 @@ func TestResolveNilURLFails(t *testing.T) {
 	if _, err := h.Resolve(context.Background(), nil); err == nil {
 		t.Fatal("Resolve(nil) expected error")
 	}
+}
+
+func TestRateLimitWaits(t *testing.T) {
+	pageURL, err := url.Parse(pageURLText)
+	if err != nil {
+		t.Fatalf("test url: %v", err)
+	}
+
+	t.Run("a bounded Retry-After is waited out until the streak gives up", func(t *testing.T) {
+		s := &recordingSleep{}
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+		}}
+		h := snappyHost(t, handler, s)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if !strings.Contains(err.Error(), "resolve after 3 attempt(s)") {
+			t.Fatalf("Resolve() error = %v, want the streak give-up wrap", err)
+		}
+		waits := s.all()
+		if len(waits) != 2 {
+			t.Fatalf("waits = %v, want two sleeps between the tries", waits)
+		}
+		for _, w := range waits {
+			if w != 30*time.Second {
+				t.Fatalf("wait = %v, want the exact 30s the host asked for", w)
+			}
+		}
+	})
+
+	t.Run("an unbounded Retry-After gives up without camping", func(t *testing.T) {
+		s := &recordingSleep{}
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, map[string][]string{"Retry-After": {"300"}}, ""), nil
+		}}
+		h := snappyHost(t, handler, s)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if !strings.Contains(err.Error(), "resolve after 1 attempt(s)") {
+			t.Fatalf("Resolve() error = %v, want the give-up after one look", err)
+		}
+		if handler.calls.Load() != 1 || len(s.all()) != 0 {
+			t.Fatalf("calls = %d, waits = %v, want a single request and no waiting", handler.calls.Load(), s.all())
+		}
+	})
+
+	t.Run("an unknown delay ladders 5s then 15s then gives up", func(t *testing.T) {
+		s := &recordingSleep{}
+		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+			return makeResponse(429, nil, ""), nil
+		}}
+		h := snappyHost(t, handler, s)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		waits := s.all()
+		if len(waits) != 2 || waits[0] != 5*time.Second || waits[1] != 15*time.Second {
+			t.Fatalf("waits = %v, want the exact 5s/15s ladder", waits)
+		}
+	})
+
+	t.Run("a non-limit failure resets the streak", func(t *testing.T) {
+		s := &recordingSleep{}
+		var step int
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			step++
+			switch step {
+			case 1: // limited once: a real wait, not the small backoff
+				return makeResponse(429, map[string][]string{"Retry-After": {"30"}}, ""), nil
+			case 2, 4: // healthy pages
+				return makeResponse(200, nil, pageValid), nil
+			case 3, 5: // transient post failures with no limit signal
+				return makeResponse(500, nil, "boom"), nil
+			default:
+				t.Errorf("unexpected request beyond the retry budget")
+				return makeResponse(500, nil, "boom"), nil
+			}
+		}}
+		h := snappyHost(t, handler, s)
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if errors.Is(err, host.ErrRateLimited) {
+			t.Fatalf("Resolve() error = %v, mixed failures end as transient", err)
+		}
+		if !strings.Contains(err.Error(), "no direct download link returned") {
+			t.Fatalf("Resolve() error = %v, want the post failure text", err)
+		}
+		waits := s.all()
+		if len(waits) != 3 {
+			t.Fatalf("waits = %v, want one limiting pause and two ordinary backoffs", waits)
+		}
+		if waits[0] != 30*time.Second {
+			t.Fatalf("first wait = %v, want the host-mandated 30s", waits[0])
+		}
+		for _, w := range waits[1:] {
+			if w > 5*time.Millisecond {
+				t.Fatalf("ordinary backoff = %v, want the 1ms base delay", w)
+			}
+		}
+	})
 }

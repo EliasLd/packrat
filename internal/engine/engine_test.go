@@ -20,10 +20,12 @@ import (
 )
 
 // fakeHost resolves every landing page to "<server>/<id>" where the test
-// server serves the matching content; selected ids can fail on purpose.
+// server serves the matching content; selected ids can fail on purpose, and
+// limitIDs makes Resolve answer with the typed rate-limit error.
 type fakeHost struct {
 	serverURL string
 	failIDs   map[string]bool
+	limitIDs  map[string]bool
 }
 
 func (f *fakeHost) Name() string { return "fake" }
@@ -32,6 +34,9 @@ func (f *fakeHost) Matches(u *url.URL) bool { return u.Host == "host.example" }
 
 func (f *fakeHost) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
 	id := pageURL.Path[strings.LastIndex(pageURL.Path, "/")+1:]
+	if f.limitIDs[id] {
+		return host.DirectLink{}, &host.RateLimitedError{Detail: "status 429"}
+	}
 	if f.failIDs[id] {
 		return host.DirectLink{}, errors.New("host says no")
 	}
@@ -281,6 +286,91 @@ func TestEngineNothingToDownloadWhenEveryResolveFails(t *testing.T) {
 	dones := col.of(event.RunDone)
 	if len(dones) != 1 || dones[0].Stats.Done != 0 || dones[0].Stats.Failed != 3 {
 		t.Fatalf("run done events = %+v, want done=0 failed=3", dones)
+	}
+}
+
+// oneGroup returns a single group with n identically-shaped parts so
+// streak tests can dial the abort threshold precisely.
+func oneGroup(n int) []link.Group {
+	parts := make([]*link.Part, 0, n)
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("part%d", i)
+		parts = append(parts, &link.Part{
+			Link:     link.Link{PageURL: "https://host.example/" + id, ID: id},
+			DirName:  "G",
+			FileName: "G." + id + ".rar",
+		})
+	}
+	return []link.Group{{Name: "G", Parts: parts}}
+}
+
+func TestEngineAbortsResolveAfterSustainedRateLimits(t *testing.T) {
+	dir := t.TempDir() // nothing resolves, so no downloads must run
+	const links = 6
+	limited := map[string]bool{}
+	for i := 1; i <= links; i++ {
+		limited[fmt.Sprintf("part%d", i)] = true
+	}
+	registry := host.NewRegistry(&fakeHost{limitIDs: limited})
+
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
+
+	err := eng.Run(context.Background(), oneGroup(links))
+	if err == nil || !strings.Contains(err.Error(), "host is rate limiting") {
+		t.Fatalf("Run() error = %v, want the rate-limit bail-out", err)
+	}
+	failed := col.of(event.ResolveFail)
+	if len(failed) != links {
+		t.Fatalf("resolve failures = %d, want all %d parts failed fast", len(failed), links)
+	}
+	for _, e := range failed {
+		if !errors.Is(e.Err, host.ErrRateLimited) {
+			t.Fatalf("resolve failure = %v, want the typed rate-limit reason", e.Err)
+		}
+	}
+	if len(col.of(event.DownloadStart)) != 0 {
+		t.Fatal("nothing may download when the resolve phase bailed out")
+	}
+	dones := col.of(event.RunDone)
+	if len(dones) != 1 || dones[0].Stats.Failed != links {
+		t.Fatalf("run done events = %+v, want failed=%d", dones, links)
+	}
+}
+
+func TestEngineRateLimitStreakResetsOnSuccess(t *testing.T) {
+	// a server with content for every part id, so only the two limiting
+	// parts fail at all
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		content := "content for " + strings.TrimPrefix(r.URL.Path, "/")
+		w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		_, _ = w.Write([]byte(content))
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	// only the first two parts limit: two hits in a row stay below the
+	// abort threshold, and the healthy results reset whatever follows
+	registry := host.NewRegistry(&fakeHost{
+		serverURL: server.URL,
+		limitIDs:  map[string]bool{"part1": true, "part2": true},
+	})
+
+	col := &collector{}
+	eng := engine.New(registry, engine.Options{OutDir: dir, Observe: col.observe})
+
+	err := eng.Run(context.Background(), oneGroup(6))
+	if err == nil || !strings.Contains(err.Error(), "2 part(s) failed") {
+		t.Fatalf("Run() error = %v, want the plain failure count", err)
+	}
+	if len(col.of(event.ResolveFail)) != 2 {
+		t.Fatalf("resolve failures = %d, want the two limiting parts only", len(col.of(event.ResolveFail)))
+	}
+	if len(col.of(event.DownloadStart)) != 4 {
+		t.Fatalf("downloads started = %d, want the healthy four", len(col.of(event.DownloadStart)))
+	}
+	dones := col.of(event.RunDone)
+	if len(dones) != 1 || dones[0].Stats.Done != 4 || dones[0].Stats.Failed != 2 {
+		t.Fatalf("run done events = %+v, want done=4 failed=2", dones)
 	}
 }
 
