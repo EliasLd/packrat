@@ -10,9 +10,9 @@ packrat is a cross-platform downloader for multi-part file hosting, made
 for grabbing **FitGirl repacks** from the terminal: it reads a text file
 of the repack's landing-page links, resolves each one to its direct
 download link, and fetches every part concurrently into one directory per
-archive — through a live terminal view, or script-friendly plain output.
+archive.
 
-![packrat downloading a FitGirl repack](./demo.gif)
+![packrat downloading a FitGirl repack](./assets/demo.gif)
 
 ## Features
 
@@ -191,8 +191,7 @@ branches with conventional commits.
 
 ## Support the project
 
-If packrat is useful to you, consider leaving a ⭐ on the repository —
-it is always appreciated.
+If packrat is useful to you, consider leaving a ⭐ on the repository, it's always appreciated.
 
 <a href="https://www.star-history.com/?repos=EliasLd%2Fpackrat&type=date&legend=top-left">
   <picture>
