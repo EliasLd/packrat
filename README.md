@@ -43,6 +43,7 @@ Copy your repack's part links into a text file (one per line), then run:
 | Provider | Website |
 | --- | --- |
 | FuckingFast | https://fuckingfast.co |
+| FileKeeper | https://filekeeper.net |
 
 > [!NOTE]
 > Requests toward the provider are paced and jittered, and rate-limit
