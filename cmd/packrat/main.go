@@ -14,6 +14,7 @@ import (
 	"github.com/EliasLd/packrat/internal/engine"
 	"github.com/EliasLd/packrat/internal/event"
 	"github.com/EliasLd/packrat/internal/host"
+	"github.com/EliasLd/packrat/internal/host/filekeeper"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 	"github.com/EliasLd/packrat/internal/link"
 	"github.com/EliasLd/packrat/internal/ui"
@@ -159,7 +160,7 @@ func run(ctx context.Context, cancel context.CancelFunc, linkFile string, opt en
 	if err != nil {
 		return err
 	}
-	registry := host.NewRegistry(resolver)
+	registry := host.NewRegistry(filekeeper.New(), resolver)
 
 	eng := engine.New(registry, opt)
 	err = eng.Run(ctx, groups)
