@@ -1,7 +1,7 @@
-// Command probe runs the FuckingFast resolution flow against live landing
-// page URLs and reports the result, then verifies that the direct download
-// server accepts both plain Go TLS and the fingerprinted client with a
-// 1 MiB ranged read.
+// Command probe runs the resolution flow of the registered hosts against
+// live landing page URLs and reports the result, then verifies that the
+// direct download server accepts both plain Go TLS and the fingerprinted
+// client with a 1 MiB ranged read.
 //
 // Use it when download resolution breaks, to see which side changed: the
 // host pages, the download host, or nothing.
@@ -20,6 +20,8 @@ import (
 
 	bhttp "github.com/bogdanfinn/fhttp"
 
+	"github.com/EliasLd/packrat/internal/host"
+	"github.com/EliasLd/packrat/internal/host/filekeeper"
 	"github.com/EliasLd/packrat/internal/host/fuckingfast"
 )
 
@@ -34,7 +36,7 @@ func main() {
 		os.Exit(2)
 	}
 	ctx := context.Background()
-	resolver, err := fuckingfast.New()
+	registry, err := buildRegistry()
 	if err != nil {
 		fatal(err)
 	}
@@ -51,7 +53,13 @@ func main() {
 		}
 		u.Fragment = "" // resolution targets the landing page, not the fragment
 
-		fmt.Printf("resolving %s\n", u)
+		resolver, err := registry.Lookup(u)
+		if err != nil {
+			fmt.Printf("  [FAIL] %v\n", err)
+			failed = true
+			continue
+		}
+		fmt.Printf("resolving %s via %s\n", u, resolver.Name())
 		direct, err := resolver.Resolve(ctx, u)
 		if err != nil {
 			fmt.Printf("  [FAIL] %v\n", err)
@@ -67,6 +75,15 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
+}
+
+// buildRegistry wires the probe's hosts, in the same order packrat uses.
+func buildRegistry() (*host.Registry, error) {
+	ff, err := fuckingfast.New()
+	if err != nil {
+		return nil, err
+	}
+	return host.NewRegistry(filekeeper.New(), ff), nil
 }
 
 func fatal(err error) {
