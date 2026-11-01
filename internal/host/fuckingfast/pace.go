@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/EliasLd/packrat/internal/event"
+	"github.com/EliasLd/packrat/internal/host"
 )
 
 // defaultRequestInterval keeps the resolver from bursting: no two requests
@@ -14,10 +15,6 @@ import (
 // requests per link, so pacing doubles the resolve phase from seconds to
 // roughly its duration in links — polite without being slow.
 const defaultRequestInterval = 500 * time.Millisecond
-
-// sleeper waits for d, interruptible through ctx. Split from the clock so
-// tests can assert scheduled waits without sleeping.
-type sleeper func(ctx context.Context, d time.Duration) error
 
 // requestLimiter serializes requests so the gap between any two starts is
 // at least minInterval (with jitter). One Host instance owns one limiter,
@@ -28,25 +25,14 @@ type requestLimiter struct {
 	minInterval time.Duration
 	next        time.Time // earliest request start not yet granted
 	now         func() time.Time
-	sleep       sleeper
-}
-
-// sleepFor waits d, interruptible through ctx, without adding jitter (the
-// callers decide pacing and jitter themselves).
-func sleepFor(ctx context.Context, d time.Duration) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d):
-		return nil
-	}
+	sleep       host.Sleeper
 }
 
 func newRequestLimiter() *requestLimiter {
 	return &requestLimiter{
 		minInterval: defaultRequestInterval,
 		now:         time.Now,
-		sleep:       sleepFor,
+		sleep:       host.SleepFor,
 	}
 }
 
@@ -91,7 +77,7 @@ func WithClock(now func() time.Time) Option {
 
 // WithSleep replaces how waits are performed, for both the limiter's slot
 // spacing and the rate-limit waits (tests).
-func WithSleep(s sleeper) Option {
+func WithSleep(s host.Sleeper) Option {
 	return func(h *Host) {
 		h.sleep = s
 		h.limiter.sleep = s

@@ -15,7 +15,6 @@ import (
 	"math/rand"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -36,44 +35,9 @@ var ErrLayoutChanged = errors.New("download button markup not found")
 // It is treated as transient and retried.
 var ErrNoDirectLink = errors.New("no direct download link returned")
 
-// Rate-limit wait policy: waits requested by the host are clamped into
-// [limitWaitMin, limitWaitMax]; a Retry-After above the cap, or
-// limitGiveUp limiting answers in a row inside one Resolve, abandons the
-// link instead of camping on a host that asked for minutes.
-const (
-	limitWaitMin    = 2 * time.Second
-	limitWaitMax    = time.Minute
-	limitGiveUp     = 3
-	limitLadderBase = 5 * time.Second
-)
-
-// limitWait decides the pause after a rate-limit answer and whether the
-// link should be abandoned instead. A Retry-After wins over the ladder; a
-// streak of limiting answers (attempt failures, not resets) triggers the
-// give-up so a long block ends fast and visibly.
-func limitWait(retryAfter time.Duration, attempt, streak int) (time.Duration, bool) {
-	if retryAfter > limitWaitMax || streak >= limitGiveUp {
-		return 0, true
-	}
-	if retryAfter > 0 {
-		return clampLimitWait(retryAfter), false
-	}
-	wait := limitLadderBase
-	for i := 1; i < attempt; i++ {
-		wait *= 3
-	}
-	return clampLimitWait(wait), false
-}
-
-func clampLimitWait(d time.Duration) time.Duration {
-	if d < limitWaitMin {
-		return limitWaitMin
-	}
-	if d > limitWaitMax {
-		return limitWaitMax
-	}
-	return d
-}
+// Rate-limit answers route through the shared wait policy carried by
+// internal/host; this host keeps the FuckingFast-tuned defaults.
+var limitWaitPolicy = host.DefaultWaitPolicy()
 
 // UserAgent is the browser user agent sent with requests to this host,
 // covering both landing page fetches and direct downloads.
@@ -87,48 +51,6 @@ var (
 	hxPostRe = regexp.MustCompile(`hx-post\s*=\s*"([^"]+)"`)
 	titleRe  = regexp.MustCompile(`(?s)<title>(.*?)</title>`)
 )
-
-// limitPhrases are the markers a rate-limit or IP-block page leaves in its
-// body even when it answers status 200. Deliberately short and specific.
-var limitPhrases = []string{"rate limit", "rate-limit", "ratelimit", "too many requests"}
-
-// parseRetryAfter reads a Retry-After header; only the seconds form is
-// supported, HTTP-date responses count as unknown.
-func parseRetryAfter(v string) (time.Duration, bool) {
-	secs, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || secs <= 0 {
-		return 0, false
-	}
-	return time.Duration(secs) * time.Second, true
-}
-
-// hasLimitPhrase reports whether the body looks like a rate-limit page.
-func hasLimitPhrase(body []byte) bool {
-	lower := strings.ToLower(string(body))
-	for _, phrase := range limitPhrases {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-// rateLimited reports a "back off" signal from a failed exchange. The
-// response carrying a Retry-After header always wins, then the explicit
-// limit statuses, then the body sniff as the last resort for app-level
-// limits that answer status 200.
-func rateLimited(status int, retryAfter string, body []byte) *host.RateLimitedError {
-	if ra, ok := parseRetryAfter(retryAfter); ok {
-		return &host.RateLimitedError{RetryAfter: ra, Detail: fmt.Sprintf("status %d", status)}
-	}
-	if status == bhttp.StatusTooManyRequests || status == bhttp.StatusForbidden || status == bhttp.StatusServiceUnavailable {
-		return &host.RateLimitedError{Detail: fmt.Sprintf("status %d", status)}
-	}
-	if len(body) > 0 && hasLimitPhrase(body) {
-		return &host.RateLimitedError{Detail: "page suggests rate limiting"}
-	}
-	return nil
-}
 
 // HTTPClient abstracts the underlying transport so tools and tests can swap
 // the fingerprinted client for fakes or alternate fingerprints.
@@ -154,14 +76,14 @@ type Host struct {
 	client    HTTPClient
 	retries   int
 	limiter   *requestLimiter
-	sleep     sleeper // limiter slots and rate-limit waits share one seam
+	sleep     host.Sleeper // limiter slots and rate-limit waits share one seam
 	observe   event.Observer
 	baseDelay time.Duration
 }
 
 // New builds a Host with the default browser-fingerprinted client.
 func New(opts ...Option) (*Host, error) {
-	h := &Host{retries: 3, baseDelay: time.Second, limiter: newRequestLimiter(), sleep: sleepFor}
+	h := &Host{retries: 3, baseDelay: time.Second, limiter: newRequestLimiter(), sleep: host.SleepFor}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -231,7 +153,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 		if errors.As(err, &limited) {
 			limitStreak++
 			var giveUp bool
-			if wait, giveUp = limitWait(limited.RetryAfter, attempt, limitStreak); giveUp {
+			if wait, giveUp = limitWaitPolicy.Wait(limited.RetryAfter, attempt, limitStreak); giveUp {
 				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, limited)
 			}
 			if h.observe != nil {
@@ -296,7 +218,7 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) 
 		return nil, fmt.Errorf("read page: %w", err)
 	}
 	if resp.StatusCode != bhttp.StatusOK {
-		if limited := rateLimited(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
+		if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
 			return nil, limited
 		}
 		return nil, fmt.Errorf("download page status %d", resp.StatusCode)
@@ -314,8 +236,8 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) 
 func parsePage(body []byte, pageURL *url.URL) (endpoint, filename string, err error) {
 	m := hxPostRe.FindSubmatch(body)
 	if m == nil {
-		if hasLimitPhrase(body) {
-			return "", "", &host.RateLimitedError{Detail: "page suggests rate limiting"}
+		if limited := host.ClassifyLimit(bhttp.StatusOK, "", body); limited != nil {
+			return "", "", limited
 		}
 		return "", "", fmt.Errorf("%w (page %s)", ErrLayoutChanged, pageURL.Redacted())
 	}
@@ -351,7 +273,7 @@ func (h *Host) triggerDownload(ctx context.Context, endpoint string, referer *ur
 		return direct, nil
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if limited := rateLimited(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
+	if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
 		return "", limited
 	}
 	return "", fmt.Errorf("%w: status %d, body %.80s", ErrNoDirectLink, resp.StatusCode, body)

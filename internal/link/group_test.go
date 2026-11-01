@@ -67,6 +67,18 @@ func TestGroup(t *testing.T) {
 			wantNames: []string{"Game_ Rebirth__"},
 			wantParts: map[string][]string{"Game_ Rebirth__": {"Game_ Rebirth__.part01.rar"}},
 		},
+		{
+			name: "path-named links group as one archive in part order",
+			links: []link.Link{
+				{PageURL: "https://filekeeper.net/c3/Game--x.part03.rar", ID: "c3", Name: "Game--x.part03.rar"},
+				{PageURL: "https://filekeeper.net/c1/Game--x.part01.rar", ID: "c1", Name: "Game--x.part01.rar"},
+				{PageURL: "https://filekeeper.net/c2/Game--x.part02.rar", ID: "c2", Name: "Game--x.part02.rar"},
+			},
+			wantNames: []string{"Game--x"},
+			wantParts: map[string][]string{
+				"Game--x": {"Game--x.part01.rar", "Game--x.part02.rar", "Game--x.part03.rar"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
