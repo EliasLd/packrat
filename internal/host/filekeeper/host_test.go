@@ -289,6 +289,12 @@ func TestResolveForgesItsCookiePerRequest(t *testing.T) {
 }
 
 func TestResolveDeadFile(t *testing.T) {
+	t.Run("ErrFileGone is the shared host sentinel", func(t *testing.T) {
+		if !errors.Is(filekeeper.ErrFileGone, host.ErrFileGone) {
+			t.Fatal("filekeeper.ErrFileGone must alias host.ErrFileGone")
+		}
+	})
+
 	t.Run("a dead link fails without retrying", func(t *testing.T) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

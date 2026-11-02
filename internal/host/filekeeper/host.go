@@ -27,8 +27,9 @@ import (
 )
 
 // ErrFileGone means the file no longer exists (or the code never matched
-// one). It is permanent: retrying cannot bring it back.
-var ErrFileGone = errors.New("file no longer exists on this host")
+// one). It carries the shared host.ErrFileGone sentinel, so every host's
+// dead file reads the same to callers.
+var ErrFileGone = host.ErrFileGone
 
 // ErrCAPTCHARequired means this particular file asks for a captcha. packrat
 // never solves captchas, so the file fails permanently with a clear message.

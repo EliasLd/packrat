@@ -123,8 +123,8 @@ func (h *Host) Matches(u *url.URL) bool {
 }
 
 // Resolve turns a landing page URL into a direct download link.
-// Transient failures are retried with growing delays; ErrLayoutChanged is
-// returned immediately because retrying cannot help.
+// Transient failures are retried with growing delays; ErrLayoutChanged and
+// dead files return immediately because retrying cannot help.
 func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
 	if pageURL == nil {
 		return host.DirectLink{}, errors.New("page URL is nil")
@@ -139,7 +139,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 		if err == nil {
 			return direct, nil
 		}
-		if errors.Is(err, ErrLayoutChanged) {
+		if errors.Is(err, ErrLayoutChanged) || errors.Is(err, host.ErrFileGone) {
 			return host.DirectLink{}, err
 		}
 		lastErr = err
@@ -216,6 +216,11 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read page: %w", err)
+	}
+	switch resp.StatusCode {
+	// a dead file answers status 404 or 410 — permanent, like FileKeeper's
+	case bhttp.StatusNotFound, bhttp.StatusGone:
+		return nil, host.ErrFileGone
 	}
 	if resp.StatusCode != bhttp.StatusOK {
 		if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -276,18 +277,25 @@ func TestRateLimitResponses(t *testing.T) {
 		}
 	})
 
-	t.Run("an unrecognized failure keeps the old plain error", func(t *testing.T) {
-		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
-			return makeResponse(404, nil, "not found"), nil
-		}}
-		h := snappyHost(t, handler, &recordingSleep{})
+	t.Run("a dead file is gone forever, not retried", func(t *testing.T) {
+		for _, status := range []int{404, 410} {
+			t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+				handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+					return makeResponse(status, nil, "not found"), nil
+				}}
+				h := snappyHost(t, handler, &recordingSleep{})
 
-		_, err := h.Resolve(context.Background(), pageURL)
-		if err == nil || !strings.Contains(err.Error(), "download page status 404") {
-			t.Fatalf("Resolve() error = %v, want the plain status error", err)
-		}
-		if errors.Is(err, host.ErrRateLimited) {
-			t.Fatal("404 must not count as a rate limit")
+				_, err := h.Resolve(context.Background(), pageURL)
+				if !errors.Is(err, host.ErrFileGone) {
+					t.Fatalf("Resolve() error = %v, want host.ErrFileGone", err)
+				}
+				if errors.Is(err, host.ErrRateLimited) {
+					t.Fatal("a dead file must not count as a rate limit")
+				}
+				if handler.calls.Load() != 1 {
+					t.Fatalf("calls = %d, want 1: retrying a dead file cannot help", handler.calls.Load())
+				}
+			})
 		}
 	})
 }
