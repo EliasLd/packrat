@@ -332,6 +332,25 @@ func TestResolveDeadFile(t *testing.T) {
 	})
 }
 
+func TestResolveBotChallenge(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head>`))
+	})
+	srv := httptest.NewServer(mux)
+	h, _ := resolver(t, srv)
+
+	_, err := h.Resolve(context.Background(), pageURL(t, srv, pagePath))
+	if !errors.Is(err, host.ErrChallengeRequired) {
+		t.Fatalf("Resolve() error = %v, want ErrChallengeRequired", err)
+	}
+	if !strings.Contains(err.Error(), "fetch page:") {
+		t.Fatalf("Resolve() error = %v, want the page fetch stage in the text", err)
+	}
+}
+
 func TestResolveLayoutChanged(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -507,7 +526,7 @@ func TestResolverReportsCooldowns(t *testing.T) {
 	if cooldowns[0].Wait != 30*time.Second {
 		t.Fatalf("cooldown waits = %v, want the host-mandated 30s", cooldowns[0].Wait)
 	}
-	if cooldowns[0].Err == nil || cooldowns[0].Err.Error() != "host rate limit (status 429): retry after 30s" {
+	if cooldowns[0].Err == nil || cooldowns[0].Err.Error() != `host rate limit (status 429; body: "slow down"): retry after 30s` {
 		t.Fatalf("cooldown reason = %v, want the typed rate limit", cooldowns[0].Err)
 	}
 }

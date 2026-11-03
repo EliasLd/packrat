@@ -8,3 +8,10 @@ import "errors"
 // burning its retries. Use errors.Is to test for it; implementations may
 // wrap it with more context.
 var ErrFileGone = errors.New("file no longer exists on this host")
+
+// ErrChallengeRequired means the host's bot protection demands a browser
+// check packrat cannot perform: challenge pages verify visitors with
+// JavaScript that decides in the browser, never in the protocol. It is
+// permanent — retrying the same request cannot help. Use errors.Is to
+// test for it.
+var ErrChallengeRequired = errors.New("the host's bot protection requires a real browser")

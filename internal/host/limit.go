@@ -114,13 +114,29 @@ func hasLimitPhrase(body []byte) bool {
 // as the last resort for app-level limits that answer status 200.
 func ClassifyLimit(status int, retryAfter string, body []byte) *RateLimitedError {
 	if ra, ok := ParseRetryAfter(retryAfter); ok {
-		return &RateLimitedError{RetryAfter: ra, Detail: fmt.Sprintf("status %d", status)}
+		return &RateLimitedError{RetryAfter: ra, Detail: excerpted(fmt.Sprintf("status %d", status), body)}
 	}
 	if status == http.StatusTooManyRequests || status == http.StatusForbidden || status == http.StatusServiceUnavailable {
-		return &RateLimitedError{Detail: fmt.Sprintf("status %d", status)}
+		return &RateLimitedError{Detail: excerpted(fmt.Sprintf("status %d", status), body)}
 	}
 	if len(body) > 0 && hasLimitPhrase(body) {
-		return &RateLimitedError{Detail: "page suggests rate limiting"}
+		return &RateLimitedError{Detail: excerpted("page suggests rate limiting", body)}
 	}
 	return nil
+}
+
+// excerpted appends a bounded, single-line body excerpt to a limit detail,
+// so the error says what the host actually served: block and challenge
+// pages name themselves in the head of the document, quota answers in
+// their copy. The excerpt stops after 160 bytes, unbalanced on purpose.
+func excerpted(detail string, body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if s == "" {
+		return detail
+	}
+	const max = 160
+	if len(s) > max {
+		s = s[:max] + "..."
+	}
+	return fmt.Sprintf("%s; body: %q", detail, s)
 }

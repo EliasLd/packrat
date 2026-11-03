@@ -1,6 +1,7 @@
 package host_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,46 @@ func TestLimitWaitPolicy(t *testing.T) {
 			if giveUp != tt.giveUp || got != tt.want {
 				t.Fatalf("Wait(%v, %d, %d) = (%v, %v), want (%v, %v)",
 					tt.retryAfter, tt.attempt, tt.streak, got, giveUp, tt.want, tt.giveUp)
+			}
+		})
+	}
+}
+
+// TestClassifyLimit pins what a limit error carries: the status, and —
+// when a page was served — a bounded body excerpt, since the body is what
+// tells a Cloudflare challenge apart from a plain quota message.
+func TestClassifyLimit(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		retryAfter string
+		body       string
+		want       string
+	}{
+		{name: "plain status", status: 429, body: "", want: "status 429"},
+		{
+			name:   "status with a served page",
+			status: 403,
+			body:   "<!DOCTYPE html> <title>Attention Required!</title>",
+			want:   `status 403; body: "<!DOCTYPE html> <title>Attention Required!</title>"`,
+		},
+		{name: "host delay with a page", status: 200, retryAfter: "5", body: "come back soon", want: `status 200; body: "come back soon"`},
+		{name: "page text limit carries its proof", status: 200, body: "<p>Too many requests</p>", want: `page suggests rate limiting; body: "<p>Too many requests</p>"`},
+		{
+			name:   "long bodies truncate",
+			status: 403,
+			body:   strings.Repeat("a ", 200),
+			want:   `status 403; body: "` + strings.Repeat("a ", 80) + `..."`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := host.ClassifyLimit(tt.status, tt.retryAfter, []byte(tt.body))
+			if got == nil {
+				t.Fatalf("ClassifyLimit() = nil, want detail %q", tt.want)
+			}
+			if got.Detail != tt.want {
+				t.Fatalf("ClassifyLimit() detail = %q, want %q", got.Detail, tt.want)
 			}
 		})
 	}

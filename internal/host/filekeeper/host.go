@@ -184,7 +184,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 			limitStreak++
 			var giveUp bool
 			if wait, giveUp = limitWaitPolicy.Wait(limited.RetryAfter, attempt, limitStreak); giveUp {
-				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, limited)
+				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, err)
 			}
 			if h.observe != nil {
 				h.observe(event.Event{Kind: event.Cooling, Err: limited, Wait: wait})
@@ -200,13 +200,15 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 	return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", h.retries, lastErr)
 }
 
-// permanent reports failures retrying cannot fix: the file is gone or asks
-// for something packrat will not do.
+// permanent reports failures retrying cannot fix: the file is gone, asks
+// for something packrat will not do, changed its page, or the bot front
+// demands a browser.
 func permanent(err error) bool {
 	return errors.Is(err, ErrFileGone) ||
 		errors.Is(err, ErrCAPTCHARequired) ||
 		errors.Is(err, ErrPasswordProtected) ||
-		errors.Is(err, ErrLayoutChanged)
+		errors.Is(err, ErrLayoutChanged) ||
+		errors.Is(err, host.ErrChallengeRequired)
 }
 
 // jitterUp widens a wait by up to 25 percent, upward only. The ordinary
@@ -271,8 +273,11 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) (*url.URL, []byt
 		return nil, nil, ErrFileGone
 	}
 	if resp.StatusCode != http.StatusOK {
+		if challenge := host.ClassifyChallenge(body); challenge != nil {
+			return nil, nil, fmt.Errorf("fetch page: %w", challenge)
+		}
 		if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
-			return nil, nil, limited
+			return nil, nil, fmt.Errorf("fetch page: %w", limited)
 		}
 		return nil, nil, fmt.Errorf("download page status %d", resp.StatusCode)
 	}
@@ -302,6 +307,9 @@ func parsePage(body []byte, pageURL *url.URL) (downloadForm, string, error) {
 	}
 	tag := countdownTagRe.Find(body)
 	if tag == nil {
+		if challenge := host.ClassifyChallenge(body); challenge != nil {
+			return downloadForm{}, "", fmt.Errorf("%w (page %s)", challenge, pageURL.Redacted())
+		}
 		if limited := host.ClassifyLimit(http.StatusOK, "", body); limited != nil {
 			return downloadForm{}, "", limited
 		}
@@ -374,8 +382,11 @@ func (h *Host) submitDownload(ctx context.Context, landed *url.URL, form downloa
 	if fileGoneRe.Match(body) {
 		return nil, ErrFileGone
 	}
+	if challenge := host.ClassifyChallenge(body); challenge != nil {
+		return nil, fmt.Errorf("download request: %w", challenge)
+	}
 	if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
-		return nil, limited
+		return nil, fmt.Errorf("download request: %w", limited)
 	}
 	return nil, fmt.Errorf("%w: status %d, body %.80s", ErrNoDirectLink, resp.StatusCode, body)
 }
