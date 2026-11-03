@@ -3,6 +3,7 @@ package filekeeper
 import (
 	"errors"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +91,11 @@ func TestCountdownTagClassifications(t *testing.T) {
 			want: ErrFileGone,
 		},
 		{
+			name: "a cloudflare challenge page is not a layout change",
+			body: `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title></head>`,
+			want: host.ErrChallengeRequired,
+		},
+		{
 			name: "a limit text body is a typed rate limit, not a layout change",
 			body: `<p>Too many requests</p>`,
 			want: nil, // asserted as host.ErrRateLimited below
@@ -105,8 +111,10 @@ func TestCountdownTagClassifications(t *testing.T) {
 			_, _, err := parsePage([]byte(tt.body), parseTestURL(t, "https://filekeeper.net/abc123"))
 			if tt.want == nil {
 				var limited *host.RateLimitedError
-				if !errors.As(err, &limited) || limited.Detail != "page suggests rate limiting" {
-					t.Fatalf("parsePage() error = %v, want the typed rate limit", err)
+				if !errors.As(err, &limited) ||
+					!strings.Contains(limited.Detail, "page suggests rate limiting") ||
+					!strings.Contains(limited.Detail, "Too many requests") {
+					t.Fatalf("parsePage() error = %v, want the typed rate limit with its body", err)
 				}
 				return
 			}

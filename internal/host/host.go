@@ -57,6 +57,10 @@ func (r *Registry) Lookup(u *url.URL) (Host, error) {
 	return nil, fmt.Errorf("%w: %s", ErrUnknownHost, describeURL(u))
 }
 
+// Hosts returns the registered hosts in registration order. Diagnostics
+// tooling iterates them to report one state per host.
+func (r *Registry) Hosts() []Host { return r.hosts }
+
 // describeURL renders a URL for error messages without leaking credentials.
 func describeURL(u *url.URL) string {
 	if u == nil {

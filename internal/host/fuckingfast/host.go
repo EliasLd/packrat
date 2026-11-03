@@ -123,8 +123,9 @@ func (h *Host) Matches(u *url.URL) bool {
 }
 
 // Resolve turns a landing page URL into a direct download link.
-// Transient failures are retried with growing delays; ErrLayoutChanged is
-// returned immediately because retrying cannot help.
+// Transient failures are retried with growing delays; permanent failures
+// (a changed page, a dead file, a bot challenge) return immediately
+// because retrying cannot help.
 func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, error) {
 	if pageURL == nil {
 		return host.DirectLink{}, errors.New("page URL is nil")
@@ -139,7 +140,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 		if err == nil {
 			return direct, nil
 		}
-		if errors.Is(err, ErrLayoutChanged) {
+		if permanent(err) {
 			return host.DirectLink{}, err
 		}
 		lastErr = err
@@ -154,7 +155,7 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 			limitStreak++
 			var giveUp bool
 			if wait, giveUp = limitWaitPolicy.Wait(limited.RetryAfter, attempt, limitStreak); giveUp {
-				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, limited)
+				return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", attempt, err)
 			}
 			if h.observe != nil {
 				h.observe(event.Event{Kind: event.Cooling, Err: limited, Wait: wait})
@@ -168,6 +169,14 @@ func (h *Host) Resolve(ctx context.Context, pageURL *url.URL) (host.DirectLink, 
 		}
 	}
 	return host.DirectLink{}, fmt.Errorf("resolve after %d attempt(s): %w", h.retries, lastErr)
+}
+
+// permanent reports failures retrying cannot fix: a changed page, a dead
+// file, or a bot front that only a browser can pass.
+func permanent(err error) bool {
+	return errors.Is(err, ErrLayoutChanged) ||
+		errors.Is(err, host.ErrFileGone) ||
+		errors.Is(err, host.ErrChallengeRequired)
 }
 
 // jitterUp widens a wait by up to 25 percent, upward only. The ordinary
@@ -217,9 +226,17 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) 
 	if err != nil {
 		return nil, fmt.Errorf("read page: %w", err)
 	}
+	switch resp.StatusCode {
+	// a dead file answers status 404 or 410 — permanent, like FileKeeper's
+	case bhttp.StatusNotFound, bhttp.StatusGone:
+		return nil, host.ErrFileGone
+	}
 	if resp.StatusCode != bhttp.StatusOK {
+		if challenge := host.ClassifyChallenge(body); challenge != nil {
+			return nil, fmt.Errorf("fetch page: %w", challenge)
+		}
 		if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
-			return nil, limited
+			return nil, fmt.Errorf("fetch page: %w", limited)
 		}
 		return nil, fmt.Errorf("download page status %d", resp.StatusCode)
 	}
@@ -236,6 +253,9 @@ func (h *Host) fetchPage(ctx context.Context, pageURL *url.URL) ([]byte, error) 
 func parsePage(body []byte, pageURL *url.URL) (endpoint, filename string, err error) {
 	m := hxPostRe.FindSubmatch(body)
 	if m == nil {
+		if challenge := host.ClassifyChallenge(body); challenge != nil {
+			return "", "", fmt.Errorf("%w (page %s)", challenge, pageURL.Redacted())
+		}
 		if limited := host.ClassifyLimit(bhttp.StatusOK, "", body); limited != nil {
 			return "", "", limited
 		}
@@ -273,8 +293,11 @@ func (h *Host) triggerDownload(ctx context.Context, endpoint string, referer *ur
 		return direct, nil
 	}
 	body, _ := io.ReadAll(resp.Body)
+	if challenge := host.ClassifyChallenge(body); challenge != nil {
+		return "", fmt.Errorf("download request: %w", challenge)
+	}
 	if limited := host.ClassifyLimit(resp.StatusCode, resp.Header.Get("Retry-After"), body); limited != nil {
-		return "", limited
+		return "", fmt.Errorf("download request: %w", limited)
 	}
 	return "", fmt.Errorf("%w: status %d, body %.80s", ErrNoDirectLink, resp.StatusCode, body)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -27,6 +28,9 @@ var pageBroken string
 
 //go:embed testdata/page_rate_limit.html
 var pageRateLimit string
+
+//go:embed testdata/page_challenge.html
+var pageChallenge string
 
 const (
 	pageURLText  = "https://fuckingfast.co/abc123"
@@ -232,6 +236,9 @@ func TestRateLimitResponses(t *testing.T) {
 		if !errors.As(err, &limited) {
 			t.Fatalf("Resolve() error = %v, want a *host.RateLimitedError", err)
 		}
+		if !strings.Contains(err.Error(), "fetch page:") {
+			t.Fatalf("Resolve() error = %v, want the page fetch stage in the text", err)
+		}
 		if limited.RetryAfter != 30*time.Second {
 			t.Fatalf("RetryAfter = %v, want 30s", limited.RetryAfter)
 		}
@@ -252,6 +259,9 @@ func TestRateLimitResponses(t *testing.T) {
 		_, err := h.Resolve(context.Background(), pageURL)
 		if !errors.Is(err, host.ErrRateLimited) {
 			t.Fatalf("Resolve() error = %v, want host.ErrRateLimited", err)
+		}
+		if !strings.Contains(err.Error(), "download request:") {
+			t.Fatalf("Resolve() error = %v, want the download stage in the text", err)
 		}
 		if handler.calls.Load() != 6 {
 			t.Fatalf("calls = %d, want 6", handler.calls.Load())
@@ -276,18 +286,61 @@ func TestRateLimitResponses(t *testing.T) {
 		}
 	})
 
-	t.Run("an unrecognized failure keeps the old plain error", func(t *testing.T) {
+	t.Run("a dead file is gone forever, not retried", func(t *testing.T) {
+		for _, status := range []int{404, 410} {
+			t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+				handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
+					return makeResponse(status, nil, "not found"), nil
+				}}
+				h := snappyHost(t, handler, &recordingSleep{})
+
+				_, err := h.Resolve(context.Background(), pageURL)
+				if !errors.Is(err, host.ErrFileGone) {
+					t.Fatalf("Resolve() error = %v, want host.ErrFileGone", err)
+				}
+				if errors.Is(err, host.ErrRateLimited) {
+					t.Fatal("a dead file must not count as a rate limit")
+				}
+				if handler.calls.Load() != 1 {
+					t.Fatalf("calls = %d, want 1: retrying a dead file cannot help", handler.calls.Load())
+				}
+			})
+		}
+	})
+
+	t.Run("a bot challenge refuses without retrying", func(t *testing.T) {
 		handler := &fakeClient{do: func(*bhttp.Request) (*bhttp.Response, error) {
-			return makeResponse(404, nil, "not found"), nil
+			return makeResponse(403, nil, pageChallenge), nil
 		}}
 		h := snappyHost(t, handler, &recordingSleep{})
 
 		_, err := h.Resolve(context.Background(), pageURL)
-		if err == nil || !strings.Contains(err.Error(), "download page status 404") {
-			t.Fatalf("Resolve() error = %v, want the plain status error", err)
+		if !errors.Is(err, host.ErrChallengeRequired) {
+			t.Fatalf("Resolve() error = %v, want host.ErrChallengeRequired", err)
 		}
-		if errors.Is(err, host.ErrRateLimited) {
-			t.Fatal("404 must not count as a rate limit")
+		if !strings.Contains(err.Error(), "fetch page:") {
+			t.Fatalf("Resolve() error = %v, want the page fetch stage in the text", err)
+		}
+		if handler.calls.Load() != 1 {
+			t.Fatalf("calls = %d, want 1: a challenge is not retryable", handler.calls.Load())
+		}
+	})
+
+	t.Run("a challenge in a 200 page is not a layout change", func(t *testing.T) {
+		handler := &fakeClient{do: func(req *bhttp.Request) (*bhttp.Response, error) {
+			if req.Method == bhttp.MethodGet {
+				return makeResponse(200, nil, pageChallenge), nil
+			}
+			return makeResponse(200, nil, ""), nil
+		}}
+		h := snappyHost(t, handler, &recordingSleep{})
+
+		_, err := h.Resolve(context.Background(), pageURL)
+		if !errors.Is(err, host.ErrChallengeRequired) {
+			t.Fatalf("Resolve() error = %v, want host.ErrChallengeRequired", err)
+		}
+		if !strings.Contains(err.Error(), "page ") {
+			t.Fatalf("Resolve() error = %v, want the offending page in the text", err)
 		}
 	})
 }

@@ -1,0 +1,32 @@
+# Provider health fixture: the landing pages the daily "provider health"
+# workflow resolves to prove both handlers still work. Several games are
+# listed on purpose: while any link of a hoster proves the flow, that
+# hoster reads ok — a hoster only goes stale when EVERY of its links died.
+#
+# Refresh, by hand only:
+#   - only when a run goes stale: every link of that hoster died
+#   - pick one or two current repacks that offer BOTH fuckingfast and
+#     filekeeper, and paste one or two part links per hoster per game
+#   - commit the change; it also resets GitHub's 60-day scheduled-workflow
+#     keep-alive clock
+#
+# Format: one landing page URL per line; "#" comments and blank lines are
+# ignored, markdown links work too.
+
+## Red Dead Redemption 2 — parts 001-002
+https://fuckingfast.co/y0mqwf4nw1tx#RDR2_--_fitgirl-repacks.site_--_.part001.rar
+https://fuckingfast.co/2le8quecxdrc#RDR2_--_fitgirl-repacks.site_--_.part002.rar
+https://filekeeper.net/sdpo8reapl9e/RDR2_--_fitgirl-repacks.site_--_.part001.rar
+https://filekeeper.net/8cuogjr0zrmk/RDR2_--_fitgirl-repacks.site_--_.part002.rar
+
+## Cyberpunk 2077 — parts 01-02
+https://fuckingfast.co/fqzr83ry7qqd#Cyberpunk_2077_--_fitgirl-repacks.site_--_.part01.rar
+https://fuckingfast.co/ub34nfgc35z1#Cyberpunk_2077_--_fitgirl-repacks.site_--_.part02.rar
+https://filekeeper.net/pdygiyop7p46/Cyberpunk_2077_--_fitgirl-repacks.site_--_.part01.rar
+https://filekeeper.net/9eqcf2t7jqj3/Cyberpunk_2077_--_fitgirl-repacks.site_--_.part02.rar
+
+## Black Myth: Wukong — parts 001-002
+https://fuckingfast.co/ymouzuoekqxm#Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part001.rar
+https://fuckingfast.co/0rk4qb5upkm4#Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part002.rar
+https://filekeeper.net/zpgpm6ak0drc/Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part001.rar
+https://filekeeper.net/nb8rh7m5vnhl/Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part002.rar

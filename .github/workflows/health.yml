@@ -1,0 +1,70 @@
+# Health check for packrat's file hoster handlers: resolve the committed
+# fixture links and classify each hoster. A failing run is the alarm; its
+# host state lines tell whether the problem is a broken flow (broken),
+# every fixture code of a hoster dead (stale) or transport flake (infra —
+# retried once in place). A hoster whose bot front challenges the runner
+# IPs reads `blocked` and keeps the run green: nothing in the handler is
+# wrong, and no commit can answer it.
+
+name: provider health
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provider-health
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: probe provider handlers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Probe provider handlers
+        run: |
+          set -o pipefail
+          code=0
+          go run ./cmd/probe --links .github/health-links.txt 2>&1 | tee "$RUNNER_TEMP/probe.log" || code=$?
+          # exits 3 = infra: requests never got an answer, worth one polite
+          # retry after two minutes before failing the job
+          if [ "$code" -ne 3 ]; then
+            exit "$code"
+          fi
+          echo "::notice::infra failure (unanswered transports) - retrying once after two minutes"
+          sleep 120
+          go run ./cmd/probe --links .github/health-links.txt 2>&1 | tee "$RUNNER_TEMP/probe-retry.log" || code=$?
+          exit "$code"
+
+      - name: Summarize host states
+        if: always()
+        run: |
+          log="$RUNNER_TEMP/probe.log"
+          if [ -f "$RUNNER_TEMP/probe-retry.log" ]; then
+            log="$RUNNER_TEMP/probe-retry.log"
+          fi
+          {
+            echo "### Provider health probe"
+            echo
+            if [ -f "$log" ]; then
+              echo '```'
+              grep '^probe: ' "$log" || true
+              echo '```'
+              if grep -q '=blocked' "$log"; then
+                echo 'A host reads `blocked`: its bot protection challenges the GitHub runner IPs, which only a real browser can pass. This is about the CI egress, not the handler — packrat still resolves that host for real users.'
+              fi
+            else
+              echo 'The probe never produced host state lines - see the failing step log.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
