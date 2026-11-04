@@ -3,7 +3,7 @@ module github.com/EliasLd/packrat
 go 1.27
 
 require (
-	github.com/bogdanfinn/fhttp v0.7.1
+	github.com/bogdanfinn/fhttp v0.7.3
 	github.com/bogdanfinn/tls-client v1.17.1
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
